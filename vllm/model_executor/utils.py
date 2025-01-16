@@ -7,6 +7,7 @@ from vllm.utils import seed_everything
 
 
 def set_random_seed(seed: int) -> None:
+    """设置全局的随机数种子"""
     seed_everything(seed)
 
 

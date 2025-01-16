@@ -73,7 +73,9 @@ class MQLLMEngineClient:
 
     def __init__(self, ipc_path: str, engine_config: EngineConfig):
         self.context = zmq.asyncio.Context()
+        """zmq异步上下文"""
         self._errored_with: Optional[BaseException] = None
+        """错误状态信息"""
 
         # Get the configs.
         self.model_config = engine_config.model_config
@@ -89,22 +91,28 @@ class MQLLMEngineClient:
 
         # Send RPCGenerateRequest to the MQLLMEngine.
         self.input_socket: Socket = self.context.socket(zmq.constants.PUSH)
+        """向MQLLMEngine服务端发送输入的套接字"""
         self.input_socket.connect(f"{ipc_path}{IPC_INPUT_EXT}")
 
         # Receive streams of RequestOutput from the MQLLMEngine.
         self.output_socket: Socket = self.context.socket(zmq.constants.PULL)
+        """从MQLLMEngine服务端接收输出的套接字"""
         self.output_socket.connect(f"{ipc_path}{IPC_OUTPUT_EXT}")
 
         # IPC path for acking heartbeats.
         self.heartbeat_socket: Socket = self.context.socket(zmq.constants.PULL)
+        """从MQLLMEngine服务端接收心跳的套接字"""
         self.heartbeat_socket.connect(f"{ipc_path}{IPC_HEALTH_EXT}")
 
         # IPC path for the data socket.
         self.data_ipc_path = f"{ipc_path}{IPC_DATA_EXT}"
+        """数据套接字的IPC路径"""
 
         # Stream for each individual request.
         self.output_queues: Dict[str, asyncio.Queue] = {}
+        """输出队列字典:每个执行中请求的输出队列"""
         self.output_loop = asyncio.create_task(self.run_output_handler_loop())
+        """从MQLLMEngine接收输出并放到请求队列的异步任务"""
 
         # Loop to check health of the LLMEngine periodically.
         # Started after the MQLLMEngine is ready.
@@ -112,11 +120,13 @@ class MQLLMEngineClient:
 
     @staticmethod
     def is_unsupported_config(engine_args: AsyncEngineArgs):
+        """是否不支持MQLLMEngine (PP不支持)"""
         # Pipeline parallel not yet supported
         return engine_args.pipeline_parallel_size > 1
 
     @contextmanager
     def get_data_socket(self) -> Iterator[Socket]:
+        """获取数据套接字"""
         socket = self.context.socket(zmq.constants.DEALER)
         try:
             socket.connect(self.data_ipc_path)
@@ -129,6 +139,7 @@ class MQLLMEngineClient:
         heartbeats.
         """
         try:
+            # 接收来自MQLLMEngine客户端的心跳信息并检测服务端是否正常运行
             while True:
                 if await self.heartbeat_socket.poll(timeout=timeout) == 0:
                     # No heartbeat was received. Set error and exit the loop
@@ -154,34 +165,41 @@ class MQLLMEngineClient:
             self._set_errored(e)
 
     async def run_output_handler_loop(self):
-        """Get RequestOutputs from Engine and stream to Request Queues"""
+        """
+        Get RequestOutputs from Engine and stream to Request Queues
+        
+        从MQLLMEngine接收输出并放到请求的输出队列的循环
+        """
 
         try:
             while True:
                 # Poll, checking for ENGINE_DEAD
+                # 轮询输出套接字直至有输出到达
                 while await self.output_socket.poll(timeout=VLLM_RPC_TIMEOUT
                                                     ) == 0:
                     logger.debug("Waiting for output from MQLLMEngine.")
 
                     # If errored, alert all running requests.
                     if self.errored:
+                        # 向每个请求的输出队列中放入引擎出错的信息
                         for queue_j in tuple(self.output_queues.values()):
                             queue_j.put_nowait(
                                 ENGINE_DEAD_ERROR(self._errored_with))
                         return
 
+                # 从zmq的输出套接字中接收输出消息
                 message: Frame = await self.output_socket.recv(copy=False)
                 request_outputs = pickle.loads(message.buffer)
 
                 is_error = isinstance(request_outputs,
                                       (BaseException, RPCError))
-                if is_error:
+                if is_error:    # 接收到错误消息
                     if isinstance(request_outputs, RPCError):
                         rpc_error: RPCError = request_outputs
                         request_id = rpc_error.request_id
                         exception = rpc_error.exception
                         is_engine_errored = rpc_error.is_engine_errored
-                    else:
+                    else:   # 非常规异常
                         # MPLLMEngine should always return an RPCError to
                         # the output_socket when an issue arises.
                         # If we are here, we are in a bad state and
@@ -199,15 +217,18 @@ class MQLLMEngineClient:
                     if is_engine_errored and not self._errored_with:
                         self._errored_with = exception
 
-                    if request_id is None:
+                    if request_id is None:  # 错误消息没有指定请求
+                        # 向所有请求的输出队列中放入异常信息
                         for queue_i in tuple(self.output_queues.values()):
                             queue_i.put_nowait(exception)
-                    else:
+                    else:   # 错误消息指定了请求
+                        # 向对应请求的输出队列中放入异常信息
                         queue = self.output_queues.get(request_id)
                         if queue is not None:
                             queue.put_nowait(exception)
-                else:
+                else:   # 接收到正常消息
                     # Put each output into the appropriate steam.
+                    # 将每个请求输出放到对应的输出队列中
                     for request_output in request_outputs:
                         queue = self.output_queues.get(
                             request_output.request_id)
@@ -218,17 +239,23 @@ class MQLLMEngineClient:
             logger.debug("Shutting down MQLLMEngineClient output handler.")
 
     async def setup(self):
-        """Setup the client before it starts sending server requests."""
+        """Setup the client before it starts sending server requests.
+        
+        发送询问服务端是否就绪的请求并启动接收心跳信息的异步任务
+        """
 
         with self.get_data_socket() as socket:
             # Wait until server is ready.
+            # 等待MQLLMEngine服务端就绪
             response = await self._wait_for_server_rpc(socket)
 
-            self.tracing_flag = response.tracing_enabled
+            self.tracing_flag: bool = response.tracing_enabled
+            """是否启用了追踪器"""
 
             # Start health_loop.
             self.health_loop = asyncio.create_task(
                 self.run_heartbeat_loop(timeout=VLLM_RPC_TIMEOUT))
+            """接收心跳消息的异步任务"""
 
     def close(self):
         """Destroy the ZeroMQ Context."""
@@ -241,6 +268,7 @@ class MQLLMEngineClient:
         self.output_loop.cancel()
 
     def _set_errored(self, e: BaseException):
+        """设置错误状态信息"""
         logger.exception(repr(e))
         if self._errored_with is None:
             self._errored_with = e
@@ -250,7 +278,17 @@ class MQLLMEngineClient:
                                          expected_type: Any,
                                          error_message: str,
                                          socket: Socket) -> Any:
-        """Send an RPC request that is expecting data back."""
+        """Send an RPC request that is expecting data back.
+
+        Args:
+            request (RPCStartupRequest): 待发送的请求
+            expected_type (Any): 预期的接收数据类型
+            error_message (str): 发送错误时抛出的异常信息
+            socket (Socket): 用于发送和接收的套接字
+
+        Returns:
+            Any: expected_type类型的接收数据
+        """
 
         # Ping RPCServer with a request.
         await socket.send_multipart((pickle.dumps(request), ), copy=False)
@@ -320,11 +358,16 @@ class MQLLMEngineClient:
         return self.model_config
 
     async def is_tracing_enabled(self) -> bool:
+        """是否启用了追踪器"""
         return self.tracing_flag
 
     async def _wait_for_server_rpc(self, socket: Socket) -> RPCStartupResponse:
-        """Wait for the RPCServer to start up."""
+        """Wait for the RPCServer to start up.
+        
+        发送服务端是否就绪的请求并接收响应以判断服务端是否正常启动
+        """
 
+        # 发送服务端是否就绪的请求并接收响应以判断MQLLMEngine服务端是否正常启动
         return await self._send_get_data_rpc_request(
             request=RPCStartupRequest.IS_SERVER_READY,
             expected_type=RPCStartupResponse,
@@ -361,10 +404,12 @@ class MQLLMEngineClient:
 
     @property
     def errored(self) -> bool:
+        """客户端是否已发生错误"""
         return self._errored_with is not None
 
     @property
     def dead_error(self) -> BaseException:
+        """引擎宕机错误"""
         return ENGINE_DEAD_ERROR(self._errored_with)
 
     def generate(
@@ -460,7 +505,7 @@ class MQLLMEngineClient:
             else:
                 lp_bytes = None
 
-            request_bytes = pickle.dumps(
+            request_bytes = pickle.dumps(   # 序列化请求
                 RPCProcessRequest(
                     inputs=inputs,
                     params=params,
@@ -480,6 +525,7 @@ class MQLLMEngineClient:
             finished = False
             try:
                 while not finished:
+                    # 从请求对应的队列中读取输出
                     request_output = await queue.get()
 
                     if isinstance(request_output, BaseException):
@@ -492,6 +538,7 @@ class MQLLMEngineClient:
                 if not finished and not self.errored:
                     await self.abort(request_id)
         finally:
+            # 请求执行完成,从输出队列字典中移除该请求的字典
             self.output_queues.pop(request_id)
 
     async def start_profile(self) -> None:

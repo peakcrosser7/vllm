@@ -11,7 +11,7 @@ from vllm.transformers_utils.tokenizer_group import BaseTokenizerGroup
 
 from .data import (EncoderDecoderLLMInputs, LLMInputs, PromptInputs,
                    SingletonPromptInputs)
-from .parse import is_explicit_encoder_decoder_prompt, parse_singleton_prompt
+from .parse import ParsedStrPrompt, ParsedTextPrompt, ParsedTokensPrompt, is_explicit_encoder_decoder_prompt, parse_singleton_prompt
 
 if TYPE_CHECKING:
     from vllm.multimodal import MultiModalDataDict
@@ -169,7 +169,9 @@ class InputPreprocessor:
         prompt_token_ids: List[int],
         prompt_adapter_request: Optional[PromptAdapterRequest],
     ) -> List[int]:
+        """应用提示词适配器"""
         if prompt_adapter_request:
+            # 在提示词前填充指定数量的虚拟token槽
             prompt_token_ids = (
                 [0] * prompt_adapter_request.prompt_adapter_num_virtual_tokens
                 + prompt_token_ids)
@@ -227,6 +229,7 @@ class InputPreprocessor:
         * multi_modal_data
         '''
 
+        # 解析提示词输入转换为对应的Prompt对象
         parsed = parse_singleton_prompt(inputs)
 
         if parsed["type"] == "str":
@@ -261,11 +264,12 @@ class InputPreprocessor:
         lora_request: Optional[LoRARequest] = None,
     ) -> PromptComponents:
         """Async version of :meth:`_extract_prompt_components`."""
-        parsed = parse_singleton_prompt(inputs)
+        parsed: Union[ParsedStrPrompt, ParsedTextPrompt, ParsedTokensPrompt] = parse_singleton_prompt(inputs)
 
         if parsed["type"] == "str":
-            prompt = parsed["content"]
-            prompt_token_ids = await self._tokenize_prompt_async(
+            prompt: str = parsed["content"]
+            # 将提示词分词为token-IDs
+            prompt_token_ids: List[int] = await self._tokenize_prompt_async(
                 prompt,
                 request_id=request_id,
                 lora_request=lora_request,
@@ -273,11 +277,11 @@ class InputPreprocessor:
             multi_modal_data = None
         elif parsed["type"] == "tokens":
             prompt = None
-            prompt_token_ids = parsed["content"]["prompt_token_ids"]
+            prompt_token_ids: List[int] = parsed["content"]["prompt_token_ids"]
             multi_modal_data = parsed["content"].get("multi_modal_data")
         elif parsed["type"] == "text":
-            prompt = parsed["content"]["prompt"]
-            prompt_token_ids = await self._tokenize_prompt_async(
+            prompt: str = parsed["content"]["prompt"]
+            prompt_token_ids: List[int] = await self._tokenize_prompt_async(
                 prompt,
                 request_id=request_id,
                 lora_request=lora_request,
@@ -422,6 +426,7 @@ class InputPreprocessor:
         prompt_comps: PromptComponents,
         prompt_adapter_request: Optional[PromptAdapterRequest],
     ) -> LLMInputs:
+        """应用提示词适配器并组装模型输入构建LLMInput对象"""
         prompt, prompt_token_ids, multi_modal_data = prompt_comps
 
         prompt_token_ids = self._apply_prompt_adapter(
@@ -454,12 +459,14 @@ class InputPreprocessor:
         * :class:`LLMInputs` instance
         '''
 
+        # 提取提示词组件(提示词文本/token-IDs/多模态数据)
         prompt_comps = self._extract_prompt_components(
             inputs,
             request_id=request_id,
             lora_request=lora_request,
         )
 
+        # 构建LLMInputs对象
         return self._build_decoder_only_llm_inputs(
             prompt_comps,
             prompt_adapter_request=prompt_adapter_request,
@@ -473,12 +480,14 @@ class InputPreprocessor:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
     ) -> LLMInputs:
         """Async version of :meth:`_process_decoder_only_prompt`."""
+        # 提取提示词组件(提示词文本/token-IDs/多模态数据)
         prompt_comps = await self._extract_prompt_components_async(
             inputs,
             request_id=request_id,
             lora_request=lora_request,
         )
 
+        # 构建LLMInputs对象
         return self._build_decoder_only_llm_inputs(
             prompt_comps,
             prompt_adapter_request=prompt_adapter_request,

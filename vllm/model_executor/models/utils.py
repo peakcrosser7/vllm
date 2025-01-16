@@ -204,6 +204,7 @@ _CPU_OFFLOAD_MAX_BYTES = 0
 
 
 def set_cpu_offload_max_bytes(max_bytes: int) -> None:
+    """设置用于卸载模型权重的CPU内存上限(单位:B)"""
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
     _CPU_OFFLOAD_BYTES = 0
     _CPU_OFFLOAD_MAX_BYTES = max_bytes
@@ -275,14 +276,15 @@ def make_layers(
     """
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
+    # 当前PP-stage的起止层号
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
-                                            get_pp_group().rank_in_group,
-                                            get_pp_group().world_size)
+                                            get_pp_group().rank_in_group,   # PP-rank
+                                            get_pp_group().world_size)      # global-size
     modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+        [PPMissingLayer() for _ in range(start_layer)] + [  # start_layer前的层使用占位层
+            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))    # 当前PP-stage的有效层
             for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])    # end_layer及之后的层使用占位层
     return start_layer, end_layer, modules
 
 

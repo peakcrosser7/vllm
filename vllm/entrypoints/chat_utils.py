@@ -427,8 +427,8 @@ def _parse_chat_message_content(
     message: ChatCompletionMessageParam,
     mm_tracker: BaseMultiModalItemTracker,
 ) -> List[ConversationMessage]:
-    role = message["role"]
-    content = message.get("content")
+    role = message["role"]  # 对话对应的角色
+    content = message.get("content")    # 对话的内容
 
     if content is None:
         content = []
@@ -466,6 +466,7 @@ def _postprocess_messages(messages: List[ConversationMessage]) -> None:
     # this is how tool-use chat templates will expect them moving forwards
     # so, for messages that have tool_calls, parse the string (which we get
     # from openAI format) to dict
+    # 将assistant角色的"tool_calls"的函数参数由JSON字符串转换为字典
     for message in messages:
         if (message["role"] == "assistant" and "tool_calls" in message
                 and isinstance(message["tool_calls"], list)):
@@ -498,10 +499,13 @@ def parse_chat_messages_futures(
     model_config: ModelConfig,
     tokenizer: AnyTokenizer,
 ) -> Tuple[List[ConversationMessage], Awaitable[Optional[MultiModalDataDict]]]:
+    """解析对话的消息内容"""
     conversation: List[ConversationMessage] = []
     mm_tracker = AsyncMultiModalItemTracker(model_config, tokenizer)
 
+    # 遍历逐条消息
     for msg in messages:
+        # 解析对话的消息内容
         sub_messages = _parse_chat_message_content(msg, mm_tracker)
 
         conversation.extend(sub_messages)

@@ -127,7 +127,9 @@ class SamplingParams(
     """
 
     n: int = 1
+    """同一提示词生成的返回给用户的序列数"""
     best_of: Optional[int] = None
+    """从同一提示词生成的输出序列数"""
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -136,32 +138,47 @@ class SamplingParams(
     top_k: int = -1
     min_p: float = 0.0
     seed: Optional[int] = None
+    """采样的随机数种子"""
     use_beam_search: bool = False
+    """是否使用集束搜索来进行采样"""
     length_penalty: float = 1.0
+    """用于Beam-search的序列长度的惩罚系数"""
     early_stopping: Union[bool, str] = False
     stop: Optional[Union[str, List[str]]] = None
+    """用于停止生成的字符串列表"""
     stop_token_ids: Optional[List[int]] = None
+    """用于停止生成的token-ID列表"""
     ignore_eos: bool = False
+    """是否忽略EOS-token继续生成"""
     max_tokens: Optional[int] = 16
+    """每个输出序列最多生成的token个数"""
     min_tokens: int = 0
+    """每个输出序列最少生成的token个数"""
     logprobs: Optional[int] = None
+    """每个输出token返回的对数概率的数量"""
     prompt_logprobs: Optional[int] = None
+    """每个提示词token返回的对数概率的数量"""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.
     detokenize: bool = True
+    """是否需要对推理结果进行逆分词 (token-ID -> 文本)"""
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     # Optional[List[LogitsProcessor]] type. We use Any here because
     # Optional[List[LogitsProcessor]] type is not supported by msgspec.
     logits_processors: Optional[Any] = None
+    """根据先前生成的token修改logits的函数列表"""
     include_stop_str_in_output: bool = False
+    """在输出文本中是否需要包含用于停止生成的字符串"""
     truncate_prompt_tokens: Optional[Annotated[int, msgspec.Meta(ge=1)]] = None
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    """输出形式"""
 
     # The below fields are not supposed to be used as an input.
     # They are set in post_init.
     output_text_buffer_length: int = 0
+    """输出文本缓冲区长度"""
     _all_stop_token_ids: Set[int] = msgspec.field(default_factory=set)
 
     @staticmethod
@@ -402,6 +419,7 @@ class SamplingParams(
 
     @cached_property
     def sampling_type(self) -> SamplingType:
+        """采样方式(beam-search/贪婪/随机)"""
         if self.use_beam_search:
             return SamplingType.BEAM
         if self.temperature < _SAMPLING_EPS:

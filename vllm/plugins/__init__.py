@@ -19,11 +19,13 @@ def load_general_plugins():
 
     allowed_plugins = envs.VLLM_PLUGINS
 
+    # 查找所有vllm.general_plugins的插件
     discovered_plugins = entry_points(group='vllm.general_plugins')
     for plugin in discovered_plugins:
         logger.info("Found general plugin: %s", plugin.name)
         if allowed_plugins is None or plugin.name in allowed_plugins:
             try:
+                # 动态加载插件函数
                 func = plugin.load()
                 func()
                 logger.info("Loaded general plugin: %s", plugin.name)

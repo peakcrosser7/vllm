@@ -60,7 +60,7 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
     the last partition will have the remaining layers.
     """
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
-    if partition_list_str is not None:
+    if partition_list_str is not None:  # 指定了PP的层划分列表
         try:
             partitions = [
                 int(layer) for layer in partition_list_str.split(",")
@@ -75,7 +75,8 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
                 f"{sum(partitions)=} does not match {num_hidden_layers=}.")
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
-    else:
+    else:   # 未指定PP的层划分列表
+        # 按照PP-size均分模型层
         layers_per_partition = num_hidden_layers // pp_size
         start_layer = pp_rank * layers_per_partition
         end_layer = start_layer + layers_per_partition

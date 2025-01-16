@@ -66,7 +66,11 @@ class WorkerBase(ABC):
         See `stop_remote_worker_execution_loop` for more details.
         """
         while True:
-            output = self.execute_model(execute_model_req=None)
+            # 注:这里输入的模型执行请求为None,是因为调用该函数的都是(TP)非主worker
+            #    函数最终会在调用worker.prepare_input()时等待从TP的主worker接收执行请求
+            #    对于非主worker进程,会一直在此循环中
+            output: Optional[List[SamplerOutput]] = self.execute_model(execute_model_req=None)
+            # 输出为空时退出循环
             if output is None:
                 return None
 
@@ -127,11 +131,17 @@ class WorkerInput:
     """
 
     num_seq_groups: Optional[int] = None
+    """被调度的序列分组数"""
     blocks_to_swap_in: Optional[torch.Tensor] = None
+    """需要换入(CPU->GPU)的分块的索引元组(源分块索引,目标分块索引)CPU张量 shape[-1,2]"""
     blocks_to_swap_out: Optional[torch.Tensor] = None
+    """需要换出(GPU->CPU)的分块的索引元组(源分块索引,目标分块索引)CPU张量 shape[-1,2]"""
     blocks_to_copy: Optional[torch.Tensor] = None
+    """需要拷贝的分块的索引元组(源分块索引,目标分块索引)GPU张量 shape[-1,2]"""
     virtual_engine: int = 0
+    """PP的虚拟引擎ID"""
     num_steps: int = 1
+    """模型正向推理次数"""
 
     @classmethod
     def from_broadcasted_tensor_dict(
@@ -178,6 +188,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     model runner cannot inherit from ModelRunnerBase, use WorkerBase instead.
     """
     is_driver_worker: bool
+    """是否是TP主worker"""
     model_runner: ModelRunnerBase
     observability_config: Optional[ObservabilityConfig] = None
 
@@ -228,6 +239,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         """ Get the worker input from the broadcasted tensor dict. """
         assert self.do_metadata_broadcast
         assert not self.is_driver_worker
+        # 接收广播的数据
         broadcast_data = broadcast_tensor_dict(src=0)
         if not broadcast_data:
             return None
@@ -255,12 +267,14 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 execute_model_req.virtual_engine,
                 execute_model_req.finished_requests_ids))
 
+        # 提取previous_hidden_states
         kwargs = extract_previous_hidden_states(execute_model_req)
 
         if self.do_metadata_broadcast:
             broadcast_data = worker_input.as_broadcastable_tensor_dict()
             broadcast_data.update(model_input.as_broadcastable_tensor_dict())
             broadcast_data.update(kwargs)
+            # 广播数据到其他TP-rank
             broadcast_tensor_dict(broadcast_data, src=0)
 
         if execute_model_req.async_callback:
@@ -277,8 +291,18 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             str, torch.Tensor]]]:
         """
         Prepare the inputs to ModelRunner and workers.
+
+        Args:
+            execute_model_req (Optional[ExecuteModelRequest], optional): 执行模型请求的元数据. Defaults to None.
+
+        Returns: 
+            Optional[Tuple[BroadcastableModelInput, WorkerInput, Dict[str, torch.Tensor]]]:
+                BroadcastableModelInput: 模型输入数据
+                WorkerInput: worker输入数据
+                Dict[str, torch.Tensor]: previous_hidden_states的字典
+                
         """
-        if self.is_driver_worker:
+        if self.is_driver_worker:   # TP主worker
             if execute_model_req is None:
                 if self.do_metadata_broadcast:
                     # This signals that there's no more requests to process for
@@ -288,8 +312,9 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                     # notify all other workers to stop their execution loop.
                     broadcast_tensor_dict({}, src=0)
                 return None
+            # 获取输入并广播给其他TP非主worker
             return self._get_driver_input_and_broadcast(execute_model_req)
-        else:
+        else:   # TP非主worker
             return self._get_worker_input_from_broadcast()
 
     def execute_model(
@@ -300,6 +325,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         sequences are provided."""
         start_time = time.perf_counter()
 
+        # 准备(收发)模型/worker输入数据
+        # 注:输入execute_model_req为空时,返回的inputs也为空
         inputs = self.prepare_input(execute_model_req)
         if inputs is None:
             return None
@@ -307,6 +334,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         model_input, worker_input, kwargs = inputs
         num_steps = worker_input.num_steps
 
+        # 进行KV-Cache分块的换入,换出,拷贝
         self.execute_worker(worker_input)
 
         # If there is no input, we don't need to execute the model.
@@ -315,7 +343,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         intermediate_tensors = None
         orig_model_execute_time = 0.0
-        if not get_pp_group().is_first_rank:
+        if not get_pp_group().is_first_rank:    # 非PP第一个stage
+            # 接收上一PP-stage发送的中间张量
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
@@ -324,7 +353,8 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
 
-        output = self.model_runner.execute_model(
+        # 执行模型前向推理及采样
+        output: Optional[Union[List[SamplerOutput], IntermediateTensors]] = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]
             if self.kv_cache is not None else None,
@@ -334,15 +364,20 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         )
 
         model_execute_time = time.perf_counter() - start_time
+        # 非PP最后一个stage
         if not get_pp_group().is_last_rank:
             # output is IntermediateTensors
             if (self.observability_config is not None
                     and self.observability_config.collect_model_execute_time):
                 output.tensors["model_execute_time"] = torch.tensor(
                     model_execute_time + orig_model_execute_time)
+            # 同步发送张量到下一PP-stage
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
             return [None]
+        
+        # PP最后一个stage
+
         if (self.observability_config is not None
                 and self.observability_config.collect_model_execute_time
                 and output is not None):
@@ -413,6 +448,7 @@ class WorkerWrapperBase:
         self.worker_class_name = worker_class_name
         self.worker_class_fn = worker_class_fn
         self.worker: Optional[WorkerBase] = None
+        """worker对象"""
         if trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -437,15 +473,18 @@ class WorkerWrapperBase:
         # see https://github.com/NVIDIA/nccl/issues/1234
         os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
+        # 动态加载vLLM通用插件
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
         if self.worker_class_fn:
+            # 使用worker_class_fn函数获取worker类
             worker_class = self.worker_class_fn()
         else:
             mod = importlib.import_module(self.worker_module_name)
             worker_class = getattr(mod, self.worker_class_name)
 
+        # 构造worker对象
         self.worker = worker_class(*args, **kwargs)
         assert self.worker is not None
 

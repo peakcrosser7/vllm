@@ -26,6 +26,7 @@ class BlockSpaceManager(ABC):
 
     @staticmethod
     def get_block_space_manager_class(version: str):
+        """获取相应版本的KV-Cache空间管理器的类"""
         version = version.lower()
 
         if version == "v1":

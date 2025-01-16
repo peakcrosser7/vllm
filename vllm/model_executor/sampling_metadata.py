@@ -24,27 +24,36 @@ class SequenceGroupToSample:
 
     # Sequence ids for the sequence group in a previous step.
     seq_ids: List[int]
+    """待采样的序列ID列表"""
     sampling_params: SamplingParams
+    """采样参数"""
     # seq_id -> sequence data.
     seq_data: Dict[int, SequenceData]
+    """序列ID到序列数据的字典"""
     # The length of the sequence (all tokens seen in the past + new token to
     # compute attention) of the sequence group. None if it is in a decode
     # stage.
     seq_len: Optional[int]
+    """序列长度(已计算的token+需要计算的token)"""
     # The length of new query tokens to compute in the current step. None if it
     # is in a decode stage. The length of query_len <= seq_len if chunked
     # prefill is enabled.
     query_len: Optional[int]
+    """本次step需要计算的query-token的长度"""
     # A random number generator for sampling.
     generator: Optional[torch.Generator]
+    """用于采样的随机数生成器"""
     # True if the sequence group is in prefill stage. False if it is in a
     # decode stage.
     is_prompt: bool
+    """序列分组是否处于prefill阶段"""
     # Query token indices from logits. to compute prompt logprob. Empty if
     # prompt logprob is not required.
     prompt_logprob_indices: List[int]
+    """logits中query-token的索引(用于计算提示词的对数概率)"""
     # Sample token indices from logits. Empty if sampling is not required.
     sample_indices: List[int]
+    """logits中采样token的索引"""
 
     @property
     def do_sample(self):
@@ -72,18 +81,20 @@ def gen_seq_group_to_sample_builder(num_seqs: int):
     )
 
 
-class SamplingMetadataCache:
     """Used to cache SamplingMetadata objects between scheduler iterations"""
+class SamplingMetadataCache:
 
     def __init__(self):
         self._seq_group_to_sample_cache: Dict[int, PyObjectCache] = {}
+        """用于采样的序列分组缓存 (序列数->序列分组数据)"""
 
-    def get_cached_seq_group_to_sample(self, num_seqs):
+    def get_cached_seq_group_to_sample(self, num_seqs: int) -> SequenceGroupToSample:
+        """获取对应序列数量缓存的采样序列分组"""
         if num_seqs not in self._seq_group_to_sample_cache:
             self._seq_group_to_sample_cache[num_seqs] = PyObjectCache(
                 gen_seq_group_to_sample_builder(num_seqs))
 
-        obj = self._seq_group_to_sample_cache[num_seqs].get_object()
+        obj: SequenceGroupToSample = self._seq_group_to_sample_cache[num_seqs].get_object()
         return obj
 
     def reset(self):
@@ -136,11 +147,16 @@ class SamplingMetadata:
         reuse_sampling_tensors: bool = False,
     ) -> None:
         self.seq_groups = seq_groups
-        self.selected_token_indices = selected_token_indices
-        self.categorized_sample_indices = categorized_sample_indices
+        """待采样的序列分组列表"""
+        self.selected_token_indices: torch.Tensor = selected_token_indices
+        """在初始的模型输出中用于查找logits的token索引(包括提示词token和采样token) shape[num_query_tokens_to_logprob,]"""
+        self.categorized_sample_indices: Dict[SamplingType, torch.Tensor] = categorized_sample_indices
+        """每个采样方式对应的采样token的索引"""
         self.num_prompts = num_prompts
+        """待采样的序列分组列表中提示词序列分组的个数"""
         self.skip_sampler_cpu_output = skip_sampler_cpu_output
         self.reuse_sampling_tensors = reuse_sampling_tensors
+        """是否重用采样的张量"""
 
     @staticmethod
     def prepare(
@@ -159,6 +175,7 @@ class SamplingMetadata:
             num_prompts,
         ) = _prepare_seq_groups(seq_group_metadata_list, seq_lens, query_lens,
                                 device, generators, cache)
+        # 将列表转换为GPU张量
         selected_token_indices = async_tensor_h2d(
             selected_token_indices,
             dtype=torch.long,
@@ -198,8 +215,12 @@ def _prepare_seq_groups(
     device: str,
     generators: Optional[Dict[str, torch.Generator]] = None,
     cache: Optional[SamplingMetadataCache] = None,
-) -> Tuple[List[SequenceGroupToSample], List[int], Dict[SamplingType,
-                                                        List[int]], int, ]:
+) -> Tuple[
+        List[SequenceGroupToSample],
+        List[int],
+        Dict[SamplingType, List[int]],
+        int,
+]:
     """Prepare sequence groups and indices for sampling.
 
     Args:
@@ -219,10 +240,11 @@ def _prepare_seq_groups(
         categorized_sample_indices: See the definition from `SamplingMetadata`.
         num_prompts: Total number of prompts from `seq_group_metadata_list`.
     """
-    # Batched sequence groups for the current model forward stsep.
+    # Batched sequence groups for the current model forward step.
     seq_groups: List[SequenceGroupToSample] = []
     # A list of token indices to sample/compute logprob. It is used to
     # prune the outcome logits from the model for the performance.
+    # 在初始的模型输出中用于查找logits的token索引
     selected_token_indices: List[int] = []
     # Used for selected_token_indices.
     model_output_idx = 0
@@ -230,6 +252,7 @@ def _prepare_seq_groups(
     # Sampling type -> (
     # indices to sample/prompt logprob within pruned output logits,
     # indices to sample within pruned logits)
+    # 每个采样方式对应的采样token的索引
     categorized_sample_indices: Dict[SamplingType, List[int]] = {
         t: []
         for t in SamplingType
@@ -240,35 +263,43 @@ def _prepare_seq_groups(
     # Total number of prompts from given sequence groups.
     num_prompts = 0
 
+    # 遍历当前模型推理的每个序列分组
     for i, seq_group_metadata in enumerate(seq_group_metadata_list):
+        # 序列分组的序列ID列表
         seq_ids = seq_group_metadata.seq_data.keys()
 
         if cache is not None:
-            sample_obj = cache.get_cached_seq_group_to_sample(len(seq_ids))
+            sample_obj: SequenceGroupToSample = cache.get_cached_seq_group_to_sample(
+                len(seq_ids))
 
+            # 遍历每个序列设置序列ID
             for j, seq_id in enumerate(seq_ids):
                 sample_obj.seq_ids[j] = seq_id
 
             sample_obj.prompt_logprob_indices.clear()
             sample_obj.sample_indices.clear()
 
-        sampling_params = seq_group_metadata.sampling_params
+        sampling_params: SamplingParams = seq_group_metadata.sampling_params
         is_prompt = seq_group_metadata.is_prompt
         generator: Optional[torch.Generator] = None
         # If the current seq group is in decode stage, it is None.
         seq_len: Optional[int] = None
         query_len: Optional[int] = None
+        # 提示词token对数概率的索引列表
         prompt_logprob_indices: List[int] = (sample_obj.prompt_logprob_indices
                                              if cache is not None else [])
+        # 采样token的索引
         sample_indices: List[int] = (sample_obj.sample_indices
                                      if cache is not None else [])
         do_sample = seq_group_metadata.do_sample
 
-        if seq_group_metadata.is_prompt:
+        if seq_group_metadata.is_prompt:  # prefill请求
             if sampling_params.seed is not None:
+                # 设置随机数种子
                 generator = torch.Generator(device=device).manual_seed(
                     sampling_params.seed)
                 if generators is not None:
+                    # 记录每个请求对应的生成器
                     generators[seq_group_metadata.request_id] = generator
 
             num_prompts += 1
@@ -278,12 +309,17 @@ def _prepare_seq_groups(
             query_len, seq_len = query_lens[i], seq_lens[i]
             # If we need sampling, exclude num_prefill_sample tokens from
             # prompt logprob.
+            # 提示词对数概率的token列表长度
+            # 这里减去num_prefill_sample个token的原因是
+            # selected_token_indices会再加上num_prefill_sample,如果不减去就会多加
             prompt_logprob_len = (query_len - num_prefill_sample
                                   if do_sample else query_len)
+            # 采样的token序列长度: prefill阶段只需要采样1个token
             sample_len = num_prefill_sample if do_sample else 0
         else:
             # Decode
             prompt_logprob_len = 0
+            # decode请求每个序列需要采样1次
             sample_len = len(seq_ids) if do_sample else 0
 
             if sampling_params.seed is not None and generators is not None:
@@ -298,10 +334,12 @@ def _prepare_seq_groups(
         logits = hidden_states[selected_token_indices]
         """
 
+        # 如果需要返回提示词的对数概率,token索引列表加上提示词token数个索引
         if sampling_params.prompt_logprobs is not None:
             selected_token_indices.extend(
                 range(model_output_idx, model_output_idx + prompt_logprob_len))
         model_output_idx += prompt_logprob_len
+        # 如果需要采样,token索引列表加上采样token数个索引
         if do_sample:
             selected_token_indices.extend(
                 range(model_output_idx, model_output_idx + sample_len))
@@ -320,12 +358,16 @@ def _prepare_seq_groups(
            # sample_indices to find sample indices.
         """
 
+        # 与selected_token_indices类似
         if sampling_params.prompt_logprobs is not None:
+            # 添加提示词token对数概率索引
             prompt_logprob_indices.extend(
                 range(logit_idx, logit_idx + prompt_logprob_len))
             logit_idx += prompt_logprob_len
         if do_sample:
+            # 添加采样token索引
             sample_indices.extend(range(logit_idx, logit_idx + sample_len))
+            # 记录对应采样方式的token索引
             categorized_sample_indices[sampling_params.sampling_type].extend(
                 list(range(logit_idx, logit_idx + sample_len)))
             logit_idx += sample_len

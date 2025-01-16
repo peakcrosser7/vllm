@@ -16,6 +16,7 @@ logger = init_logger(__name__)
 
 
 async def serve_http(app: FastAPI, **uvicorn_kwargs: Any):
+    """启动FastAPI服务"""
     logger.info("Available routes are:")
     for route in app.routes:
         methods = getattr(route, "methods", None)
@@ -32,6 +33,7 @@ async def serve_http(app: FastAPI, **uvicorn_kwargs: Any):
 
     loop = asyncio.get_running_loop()
 
+    # 启动FastAPI应用服务
     server_task = loop.create_task(server.serve())
 
     def signal_handler() -> None:

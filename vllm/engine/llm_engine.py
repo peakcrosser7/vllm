@@ -6,7 +6,7 @@ from functools import partial
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict,
                     Iterable, List, Mapping, NamedTuple, Optional)
 from typing import Sequence as GenericSequence
-from typing import Set, Type, Union
+from typing import Any, Dict, Set, Type, Union
 
 import torch
 from typing_extensions import TypeVar
@@ -39,7 +39,7 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput,
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
+from vllm.sequence import (CompletionSequenceGroupOutput, EmbeddingSequenceGroupOutput, ExecuteModelRequest,
                            Sequence, SequenceGroup, SequenceGroupMetadata,
                            SequenceStatus)
 from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
@@ -59,6 +59,7 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 
 def _load_generation_config_dict(model_config: ModelConfig) -> Dict[str, Any]:
+    """加载模型的文本生成配置字典"""
     config = try_get_generation_config(
         model_config.model,
         trust_remote_code=model_config.trust_remote_code,
@@ -68,6 +69,7 @@ def _load_generation_config_dict(model_config: ModelConfig) -> Dict[str, Any]:
     if config is None:
         return {}
 
+    # 返回非默认配置
     return config.to_diff_dict()
 
 
@@ -79,36 +81,52 @@ _O = TypeVar("_O", RequestOutput, EmbeddingRequestOutput)
 class SchedulerOutputState:
     """Caches the scheduler outputs for a virtual engine. Used for Multi-Step"""
     seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None
+    """被调度序列分组的元数据列表"""
     scheduler_outputs: Optional[SchedulerOutputs] = None
+    """调度器调度输出"""
     allow_async_output_proc: bool = False
+    """是否可以异步处理模型输出"""
     last_output: Optional[SamplerOutput] = None
+    """模型推理采样的最后一个输出结果"""
 
 
 class OutputData(NamedTuple):
     outputs: List[SamplerOutput]
+    """模型执行前向推理和采样后的输出结果列表"""
     seq_group_metadata_list: List[SequenceGroupMetadata]
+    """本轮迭代被调度序列分组的元数据列表"""
     scheduler_outputs: SchedulerOutputs
+    """调度器调度输出"""
     is_async: bool
+    """是否可以异步处理模型输出"""
     is_last_step: bool
+    """是否是multi-step的最后一个step"""
     skip: List[int]
+    """需要跳过的序列索引列表"""
 
 
 class SchedulerContext:
 
     def __init__(self, multi_step_stream_outputs: bool = False):
         self.output_queue: Deque[OutputData] = deque()
+        """模型推理输出队列"""
         self.request_outputs: List[Union[RequestOutput,
                                          EmbeddingRequestOutput]] = []
+        """请求输出结果列表"""
         self.seq_group_metadata_list: Optional[
             List[SequenceGroupMetadata]] = None
+        """被调度序列分组的元数据列表"""
         self.scheduler_outputs: Optional[SchedulerOutputs] = None
+        """调度器的调度输出"""
 
         self.multi_step_stream_outputs: bool = multi_step_stream_outputs
+        """是否启用mult-step流式输出"""
 
     def append_output(self, outputs: List[SamplerOutput],
                       seq_group_metadata_list: List[SequenceGroupMetadata],
                       scheduler_outputs: SchedulerOutputs, is_async: bool,
                       is_last_step: bool):
+        """添加模型推理输出到输出队列"""
         self.output_queue.append(
             OutputData(outputs=outputs,
                        seq_group_metadata_list=seq_group_metadata_list,
@@ -120,6 +138,7 @@ class SchedulerContext:
 
 class LLMEngine:
     """An LLM engine that receives requests and generates texts.
+    (NOT SUPPORT PP)
 
     This is the main class for the vLLM engine. It receives requests
     from clients and generates texts from the LLM. It includes a tokenizer, a
@@ -293,7 +312,9 @@ class LLMEngine:
         self.observability_config = observability_config or ObservabilityConfig(
         )
         self.log_stats = log_stats
+        """是否记录统计信息"""
         self.use_cached_outputs = use_cached_outputs
+        """是否使用缓存的输出"""
 
         if not self.model_config.skip_tokenizer_init:
             self.tokenizer = self._init_tokenizer()
@@ -312,11 +333,14 @@ class LLMEngine:
             return tokenizer_group.get_lora_tokenizer(sequence.lora_request)
 
         self.seq_counter = Counter()
-        self.generation_config_fields = _load_generation_config_dict(
-            model_config)
+        """序列ID计数器"""
+        self.generation_config_fields: Dict[
+            str, Any] = _load_generation_config_dict(model_config)
+        """模型的文本生成配置字典(非默认配置)"""
 
         self.input_preprocessor = InputPreprocessor(model_config,
                                                     self.tokenizer)
+        """模型输入的预处理器"""
 
         self.input_registry = input_registry
         self.input_processor = input_registry.create_input_processor(
@@ -334,7 +358,9 @@ class LLMEngine:
             prompt_adapter_config=prompt_adapter_config,
             observability_config=self.observability_config,
         )
+        """模型执行器"""
 
+        # 不是Embedding模型
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
 
@@ -384,31 +410,38 @@ class LLMEngine:
             SchedulerOutputState()
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
+        """每个PP-rank的调度器调度输出状态的缓存"""
 
         self.scheduler_contexts = [
             SchedulerContext(multi_step_stream_outputs=self.scheduler_config.
                              multi_step_stream_outputs)
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
+        """每个PP-rank的调度器上下文"""
 
         if model_config.use_async_output_proc:
             process_model_outputs = weak_bind(self._process_model_outputs)
 
+            # 设置异步回调函数处理模型输出
             self.async_callbacks = [
+                # 在每个PP-stage的调度上下文下处理模型输出
                 partial(process_model_outputs,
                         ctx=self.scheduler_contexts[v_id])
                 for v_id in range(self.parallel_config.pipeline_parallel_size)
             ]
+            """每个PP-rank的处理模型输出的异步回调函数"""
         else:
             self.async_callbacks = []
 
         # Currently used by AsyncLLMEngine to ensure quick append
         # of request outputs to asyncio queues
         self.process_request_outputs_callback: Optional[Callable] = None
+        """处理请求输出的回调函数"""
 
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
+        # 每个PP-rank对应的virtual-engine有不同的调度器,从而有不同的KV-Cache管理器
         self.scheduler = [
             Scheduler(
                 scheduler_config, cache_config, lora_config,
@@ -417,11 +450,13 @@ class LLMEngine:
                 if model_config.use_async_output_proc else None)
             for v_id in range(parallel_config.pipeline_parallel_size)
         ]
+        """每个PP-rank的调度器"""
 
         # Metric Logging.
         if self.log_stats:
             if stat_loggers is not None:
                 self.stat_loggers = stat_loggers
+                """统计信息记录器"""
             else:
                 # Lazy import for prometheus multiprocessing.
                 # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
@@ -444,6 +479,7 @@ class LLMEngine:
                                                      self.cache_config)
 
         self.tracer = None
+        """OpenTelemetry追踪器"""
         if self.observability_config.otlp_traces_endpoint:
             self.tracer = init_tracer(
                 "vllm.llm_engine",
@@ -463,6 +499,7 @@ class LLMEngine:
                     get_tokenizer_for_seq,
                 ),
             ))
+        """序列输出处理器(用于单个解码,投机解码,mult-step解码等)"""
 
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
@@ -470,9 +507,11 @@ class LLMEngine:
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
         """
+        # GPU和CPU可用的KV-Cache分块数
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
 
+        # 设置指定的GPU的KV-Cache分块数
         if self.cache_config.num_gpu_blocks_override is not None:
             num_gpu_blocks_override = self.cache_config.num_gpu_blocks_override
             logger.info(
@@ -484,6 +523,7 @@ class LLMEngine:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+        # 初始化KV-Cache并进行模型CUDA-Graph捕获
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
     @classmethod
@@ -586,6 +626,7 @@ class LLMEngine:
         self,
         group_type: Type[_G] = BaseTokenizerGroup,
     ) -> _G:
+        """获取分词器分组的实例对象"""
         tokenizer_group = self.tokenizer
 
         if tokenizer_group is None:
@@ -605,6 +646,7 @@ class LLMEngine:
         return self.get_tokenizer_group().get_lora_tokenizer(lora_request)
 
     def _init_tokenizer(self) -> BaseTokenizerGroup:
+        """初始化分词器"""
         return init_tokenizer_from_configs(
             model_config=self.model_config,
             scheduler_config=self.scheduler_config,
@@ -633,6 +675,7 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
     ) -> None:
+        """添加输入已进行处理的请求到(未完成序列数最少的)调度器"""
         self._validate_model_inputs(processed_inputs)
         # Create the sequences.
         block_size = self.cache_config.block_size
@@ -654,7 +697,7 @@ class LLMEngine:
 
         # Create a SequenceGroup based on SamplingParams or PoolingParams
         if isinstance(params, SamplingParams):
-            seq_group = self._create_sequence_group_with_sampling(
+            seq_group: SequenceGroup = self._create_sequence_group_with_sampling(
                 request_id,
                 seq,
                 params,
@@ -683,6 +726,9 @@ class LLMEngine:
             scheduler.get_num_unfinished_seq_groups()
             for scheduler in self.scheduler
         ]
+        # 将序列分组添加到未完成序列数最少的调度器
+        # 注:LLMEngine不支持PP,即直接将请求放置到0号调度器;
+        #    AsyncLLMEngine支持PP,请求只会添加到某一PP-rank对应的调度器
         min_cost_scheduler = self.scheduler[costs.index(min(costs))]
         min_cost_scheduler.add_seq_group(seq_group)
 
@@ -755,14 +801,17 @@ class LLMEngine:
         if arrival_time is None:
             arrival_time = time.time()
 
+        # 预处理模型输入
         preprocessed_inputs = self.input_preprocessor.preprocess(
             inputs,
             request_id=request_id,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
+        # 根据模型执行输入处理
         processed_inputs = self.input_processor(preprocessed_inputs)
 
+        # 添加输入已进行处理的请求到调度器
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -888,7 +937,10 @@ class LLMEngine:
                    for scheduler in self.scheduler)
 
     def has_unfinished_requests(self) -> bool:
-        """Returns True if there are unfinished requests."""
+        """Returns True if there are unfinished requests.
+        
+        是否存在一个PP-rank的调度器中有未完成的序列
+        """
         return any(scheduler.has_unfinished_seqs()
                    for scheduler in self.scheduler)
 
@@ -923,16 +975,18 @@ class LLMEngine:
         """
         now = time.time()
 
+        # 输出队列为空
         if len(ctx.output_queue) == 0:
             return None
 
         # Get pending async postprocessor
-        if request_id:
+        if request_id:  # 只有该请求被处理
             # When we process only one request, no pop is required
             # (since later we will process all of the rest)
             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
              is_last_step, skip) = ctx.output_queue[0]
         else:
+            # 未提供请求ID时从输出队列出队一个输出结果
             (outputs, seq_group_metadata_list, scheduler_outputs, is_async,
              is_last_step, skip) = ctx.output_queue.popleft()
 
@@ -949,9 +1003,10 @@ class LLMEngine:
             outputs_by_sequence_group = outputs
 
         # Determine the requests we need to operate on
-        if request_id:
+        if request_id:  # 只有该请求要被处理
             indices = []
             for i, seq_group_meta in enumerate(seq_group_metadata_list):
+                # 仅保留与目标请求相同请求ID的序列索引
                 if seq_group_meta.request_id == request_id:
                     assert i not in skip  # Cannot be called twice
                     indices.append(i)
@@ -963,33 +1018,42 @@ class LLMEngine:
             if not indices:
                 return
         else:
+            # 每个调度执行的序列分组的索引列表
             indices = range(len(seq_group_metadata_list))  # type: ignore
 
         finished_before: List[int] = []
         finished_now: List[int] = []
+        # 遍历序列分组的序号
         for i in indices:
             if i in skip:
                 continue
 
-            seq_group_meta = seq_group_metadata_list[i]
-            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+            seq_group_meta: SequenceGroupMetadata = seq_group_metadata_list[i]
+            scheduled_seq_group: ScheduledSequenceGroup = scheduler_outputs.scheduled_seq_groups[
+                i]
 
-            seq_group = scheduled_seq_group.seq_group
+            seq_group: SequenceGroup = scheduled_seq_group.seq_group
 
             if seq_group.is_finished():
                 finished_before.append(i)
                 continue
 
-            if len(outputs) > 1:
+            if len(outputs) > 1:  # 模型输出数量>1
+                # outputs_by_sequence_group[step][sequence group]
                 output = outputs_by_sequence_group[i]
             else:
-                output = [outputs_by_sequence_group[0][i]]
+                # outputs_by_sequence_group = List[SamplerOutput]
+                output: CompletionSequenceGroupOutput = [
+                    outputs_by_sequence_group[0][i]
+                ]
 
-            if not is_async:
+            if not is_async:  # 不进行异步处理模型输出
+                # 更新已计算的token数
                 seq_group.update_num_computed_tokens(
                     scheduled_seq_group.token_chunk_size)
 
             if outputs:
+                # 记录每个推理输出的用时
                 for o in outputs:
                     if (isinstance(o, SamplerOutput)
                             and seq_group.metrics is not None):
@@ -1009,8 +1073,11 @@ class LLMEngine:
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, output)
             else:
+                # 处理提示词token的对数概率
                 self.output_processor.process_prompt_logprob(seq_group, output)
                 if seq_group_meta.do_sample:
+                    # 基于多输出序列/Beam-search等规则处理推理输出token到序列分组,
+                    # 并进行序列的KV-Cache分块表的增删
                     self.output_processor.process_outputs(
                         seq_group, output, is_async)
 
@@ -1018,34 +1085,45 @@ class LLMEngine:
                 finished_now.append(i)
 
         # Generate outputs for the requests that finished this iteration
+        # 遍历已完成生成的序列分组
         for i in finished_now:
-            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+            scheduled_seq_group: ScheduledSequenceGroup = scheduler_outputs.scheduled_seq_groups[
+                i]
 
-            seq_group = scheduled_seq_group.seq_group
+            seq_group: SequenceGroup = scheduled_seq_group.seq_group
+            # 记录首个token生成时间
             seq_group.maybe_set_first_token_time(now)
-            request_output = RequestOutputFactory.create(
-                seq_group, use_cache=self.use_cached_outputs)
+            request_output: Union[EmbeddingRequestOutput, RequestOutput,
+                                  None] = RequestOutputFactory.create(
+                                      seq_group,
+                                      use_cache=self.use_cached_outputs)
             if request_output:
+                # 添加到请求的输出结果列表
                 ctx.request_outputs.append(request_output)
 
         # When we process a single request, we skip it for the next time,
         # and invoke the request output callback (if there was final output)
-        if request_id:
+        if request_id:  # 只有该请求被处理
             assert len(indices) == 1
             skip.append(indices[0])
 
+            # 有已完成的序列分组(请求)且有请求输出回调函数
             if (finished_now
                     and self.process_request_outputs_callback is not None):
+                # 执行请求输出回调函数
                 self.process_request_outputs_callback(ctx.request_outputs)
                 ctx.request_outputs.clear()
             return
 
         # Free currently finished requests
+        # 有已完成的序列分组
         if finished_now:
             for scheduler in self.scheduler:
+                # 释放运行中序列分组并更新运行中的序列分组队列
                 scheduler.free_finished_seq_groups()
 
         # For multi-step without streaming, don't create outputs each iteration
+        # 如果不是multi-step的最后一个step并且不启用流式输出
         if not is_last_step and not ctx.multi_step_stream_outputs:
             # Immediately process request outputs here (if callback is given)
             if (finished_now
@@ -1054,17 +1132,22 @@ class LLMEngine:
                 ctx.request_outputs.clear()
             return
 
+        # multi-step最后一个step或者启用流式输出
         # Create the outputs
         for i in indices:
             if i in skip or i in finished_before or i in finished_now:
                 continue  # Avoids double processing
 
-            scheduled_seq_group = scheduler_outputs.scheduled_seq_groups[i]
+            # 未完成生成的序列分组
+            scheduled_seq_group: ScheduledSequenceGroup = scheduler_outputs.scheduled_seq_groups[
+                i]
 
             seq_group = scheduled_seq_group.seq_group
             seq_group.maybe_set_first_token_time(now)
-            request_output = RequestOutputFactory.create(
-                seq_group, use_cache=self.use_cached_outputs)
+            request_output: Union[EmbeddingRequestOutput, RequestOutput,
+                                  None] = RequestOutputFactory.create(
+                                      seq_group,
+                                      use_cache=self.use_cached_outputs)
             if request_output:
                 ctx.request_outputs.append(request_output)
 
@@ -1076,14 +1159,17 @@ class LLMEngine:
                 ctx.request_outputs.clear()
             return
 
+        # 遍历被忽略执行的序列分组
         for seq_group in scheduler_outputs.ignored_seq_groups:
             params = seq_group.sampling_params
             if params is not None and params.output_kind == (
                     RequestOutputKind.DELTA) and not seq_group.is_finished():
                 continue
 
-            request_output = RequestOutputFactory.create(
-                seq_group, use_cache=self.use_cached_outputs)
+            request_output: Union[EmbeddingRequestOutput, RequestOutput,
+                                  None] = RequestOutputFactory.create(
+                                      seq_group,
+                                      use_cache=self.use_cached_outputs)
             if request_output:
                 ctx.request_outputs.append(request_output)
 
@@ -1098,6 +1184,7 @@ class LLMEngine:
         # LLMEngine/AsyncLLMEngine directly
         if is_async:
             # Log stats.
+            # 记录调度器状态信息
             self.do_log_stats(scheduler_outputs, outputs, finished_before,
                               skip)
 
@@ -1118,9 +1205,11 @@ class LLMEngine:
             zip(seq_group_metadata_list, output, scheduled_seq_groups):
             seq_group = scheduled_seq_group.seq_group
 
+            # 序列分组已完成则跳过
             if seq_group.is_finished():
                 continue
 
+            # 更新序列分组中每个序列计算的token数及所属阶段
             seq_group.update_num_computed_tokens(
                 seq_group_metadata.token_chunk_size)
 
@@ -1133,6 +1222,7 @@ class LLMEngine:
 
                 assert len(seq_group.seqs) == 1
                 seq = seq_group.seqs[0]
+                # 为下次迭代提前添加token-ID和采样的对数概率
                 seq.append_token_id(sample.output_token, sample.logprobs)
 
     def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
@@ -1193,16 +1283,18 @@ class LLMEngine:
 
         # For llm_engine, there is no pipeline parallel support, so the engine
         # used is always 0.
+        # LLMEngine不支持PP,因此PP的虚拟引擎ID为0
         virtual_engine = 0
 
         # These are cached outputs from previous iterations. None if on first
         # iteration
-        cached_outputs = self.cached_scheduler_outputs[virtual_engine]
+        cached_outputs: SchedulerOutputState = self.cached_scheduler_outputs[
+            virtual_engine]
         seq_group_metadata_list = cached_outputs.seq_group_metadata_list
         scheduler_outputs = cached_outputs.scheduler_outputs
         allow_async_output_proc = cached_outputs.allow_async_output_proc
 
-        ctx = self.scheduler_contexts[virtual_engine]
+        ctx: SchedulerContext = self.scheduler_contexts[virtual_engine]
 
         # Clear outputs for each new scheduler iteration
         ctx.request_outputs.clear()
@@ -1210,8 +1302,10 @@ class LLMEngine:
         # Skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
         # batch has completed.
+        # 如果未启用multi-step或multi-step都执行完成
         if not self._has_remaining_steps(seq_group_metadata_list):
             # Schedule iteration
+            # 执行调度器调度
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
              ) = self.scheduler[virtual_engine].schedule()
@@ -1220,7 +1314,9 @@ class LLMEngine:
             ctx.scheduler_outputs = scheduler_outputs
 
             # Maybe switch from async mode to sync mode
+            # 不使用异步输出处理且有输出结果在输出队列
             if not allow_async_output_proc and len(ctx.output_queue) > 0:
+                # 处理一个输出结果(可能包含多个序列分组,处理包括调度器KV-Cache的更新)
                 self._process_model_outputs(ctx=ctx)
 
             if (self.scheduler_config.is_multi_step
@@ -1234,7 +1330,8 @@ class LLMEngine:
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
 
-        if not scheduler_outputs.is_empty():
+        if not scheduler_outputs.is_empty():  # 调度器的调度输出不为空
+            # 已完成的请求列表
             finished_requests_ids = self.scheduler[
                 virtual_engine].get_and_reset_finished_requests_ids()
 
@@ -1242,7 +1339,7 @@ class LLMEngine:
             # For supporting PP this is probably the best way to pass the
             # sampled_token_ids, as a separate broadcast over all the PP stages
             # will cause one virtual engine's microbatch to block the pipeline.
-            last_sampled_token_ids = \
+            last_sampled_token_ids: Optional[torch.Tensor] = \
                 self._get_last_sampled_token_ids(virtual_engine)
 
             execute_model_req = ExecuteModelRequest(
@@ -1261,48 +1358,59 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
-            outputs = self.model_executor.execute_model(
-                execute_model_req=execute_model_req)
+            # worker执行模型前向推理采样
+            outputs: Optional[
+                List[SamplerOutput]] = self.model_executor.execute_model(
+                    execute_model_req=execute_model_req)
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
             if self.scheduler_config.is_multi_step:
                 self._update_cached_scheduler_output(virtual_engine, outputs)
-        else:
+        else:  # 调度器的调度输出为空
             # Nothing scheduled => If there is pending async postprocessor,
             # then finish it here.
             if len(ctx.output_queue) > 0:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
             # No outputs in this case
             outputs = []
 
         # Finish the current step for all the sequence groups.
         if self.scheduler_config.is_multi_step:
+            # 记录调度的每个序列分组完成了一次step
             for seq_group in seq_group_metadata_list:
                 seq_group.finish_step()
 
+        # 如果未启用multi-step或multi-step都执行完成
         if not self._has_remaining_steps(seq_group_metadata_list):
             # clear the cache if we have finished all the steps.
             if self.scheduler_config.is_multi_step:
+                # 清空调度器调度输出(LLMEngine不支持PP,因此只用清空第一个)
                 self.cached_scheduler_outputs[0] = SchedulerOutputState()
 
             # Add results to the output_queue
+            # 添加模型输出到输出队列
             ctx.append_output(outputs=outputs,
                               seq_group_metadata_list=seq_group_metadata_list,
                               scheduler_outputs=scheduler_outputs,
                               is_async=allow_async_output_proc,
                               is_last_step=True)
 
+            # 有模型推理输出且采用异步输出处理
             if outputs and allow_async_output_proc:
                 assert len(outputs) == 1, (
                     "Async postprocessor expects only a single output set")
 
+                # 为下次迭代提前添加每个序列分组的token-ID和采样的对数概率
                 self._advance_to_next_step(
                     outputs[0], seq_group_metadata_list,
                     scheduler_outputs.scheduled_seq_groups)
 
             # Check if need to run the usual non-async path
+            # 不采用异步输出处理
             if not allow_async_output_proc:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
 
                 # Log stats.
@@ -1310,13 +1418,16 @@ class LLMEngine:
 
                 # Tracing
                 self.do_tracing(scheduler_outputs)
-        else:
+        else:  # 启用multi-step但仍有剩余step未执行
             # Multi-step case
+            # 直接返回调度器上下文的空请求输出列表(前面已清空)
             return ctx.request_outputs
 
+        # 所有pp-rank的调度器中均没有未完成的请求
         if not self.has_unfinished_requests():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
             assert len(ctx.output_queue) == 0
 
@@ -1326,6 +1437,7 @@ class LLMEngine:
             # the RPC thread in the workers so that they can process any other
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
+            # 停止远端worker的模型执行循环,避免torch.distributed-ops一直等待
             self.model_executor.stop_remote_worker_execution_loop()
 
         return ctx.request_outputs
@@ -1333,6 +1445,8 @@ class LLMEngine:
     def _has_remaining_steps(
         self, seq_group_metadata_list: Optional[List[SequenceGroupMetadata]]
     ) -> bool:
+        """启用mult-step调度时是否还有剩余step未执行完"""
+        # 未启用mult-step或者seq_group_metadata_list为空
         if (not self.scheduler_config.is_multi_step
                 or not seq_group_metadata_list):
             return False
@@ -1355,7 +1469,8 @@ class LLMEngine:
             seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
             scheduler_outputs: SchedulerOutputs,
             allow_async_output_proc: bool) -> None:
-        co = self.cached_scheduler_outputs[virtual_engine]
+        co: SchedulerOutputState = self.cached_scheduler_outputs[
+            virtual_engine]
 
         co.seq_group_metadata_list = seq_group_metadata_list
         co.scheduler_outputs = scheduler_outputs
@@ -1365,6 +1480,8 @@ class LLMEngine:
     def _update_cached_scheduler_output(
             self, virtual_engine: int,
             output: List[Optional[SamplerOutput]]) -> None:
+        """启用PP时缓存模型推理采样的最后一个输出结果"""
+        # 启用了PP且有模型输出
         if (self.parallel_config.pipeline_parallel_size > 1 and len(output) > 0
                 and output[0] is not None):
             last_output = output[-1]
@@ -1377,8 +1494,10 @@ class LLMEngine:
 
     def _get_last_sampled_token_ids(
             self, virtual_engine: int) -> Optional[torch.Tensor]:
-        cached_last_output = self.cached_scheduler_outputs[
-            virtual_engine].last_output
+        # 模型推理采样的最后一个输出结果
+        cached_last_output: Optional[
+            SamplerOutput] = self.cached_scheduler_outputs[
+                virtual_engine].last_output
         if (self.scheduler_config.is_multi_step
                 and self.parallel_config.pipeline_parallel_size > 1
                 and cached_last_output is not None
@@ -1635,6 +1754,7 @@ class LLMEngine:
         return self.model_executor.list_prompt_adapters()
 
     def check_health(self) -> None:
+        """检查分词器和模型执行器是否正常运行"""
         if self.tokenizer:
             self.tokenizer.check_health()
         self.model_executor.check_health()
@@ -1656,14 +1776,18 @@ class LLMEngine:
             self.model_executor._run_workers("stop_profile")
 
     def is_tracing_enabled(self) -> bool:
+        """是否启用了追踪器"""
         return self.tracer is not None
 
     def do_tracing(self, scheduler_outputs: SchedulerOutputs) -> None:
+        """对已完成的序列分组进行OpenTelemetry跟踪"""
         if self.tracer is None:
             return
 
+        # 遍历所有被调度执行的序列分组
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             seq_group = scheduled_seq_group.seq_group
+            # 对已完成的序列分组创建OpenTelemetry跟踪跨度
             if seq_group.is_finished():
                 self.create_trace_span(seq_group)
 

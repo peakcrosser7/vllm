@@ -137,6 +137,7 @@ class UsageMessage:
                      model_architecture: str,
                      usage_context: UsageContext,
                      extra_kvs: Optional[Dict[str, Any]] = None) -> None:
+        """启动一个线程报告使用信息给Server端"""
         t = Thread(target=self._report_usage_worker,
                    args=(model_architecture, usage_context, extra_kvs or {}),
                    daemon=True)

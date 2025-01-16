@@ -69,13 +69,18 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         enable_caching: bool = False,
     ) -> None:
         self.block_size = block_size
+        """KV-Cache分块大小"""
         self.num_total_gpu_blocks = num_gpu_blocks
+        """GPU上KV-Cache分块总数"""
         self.num_total_cpu_blocks = num_cpu_blocks
+        """CPU上KV-Cache分块总数"""
 
         self.sliding_window = sliding_window
+        """滑动窗口大小 (单位:token数)"""
         # max_block_sliding_window is the max number of blocks that need to be
         # allocated
         self.max_block_sliding_window = None
+        """滑动窗口所需的分块数上限"""
         if sliding_window is not None:
             # +1 here because // rounds down
             num_blocks = sliding_window // block_size + 1
@@ -86,11 +91,19 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             self.max_block_sliding_window = num_blocks + 1
 
         self.watermark = watermark
+        """内存交换水位线的比例值"""
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+        """是否启用prefix-cache"""
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
+        """内存交换水位线的分块数
+
+        如果总GPU分块数在分配给某一序列后剩余的分块数小于该水位线,则永不给该序列分组分配分块,
+        如果可用的GPU分块数在分配给某一序列后剩余的分块数小于该水位线,则将稍后再给该序列分组分配分块,
+        否则,则可以直接给该序列分组分配GPU分块
+        """
 
         self.block_allocator = CpuGpuBlockAllocator.create(
             allocator_type="prefix_caching" if enable_caching else "naive",
@@ -98,9 +111,12 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             num_cpu_blocks=num_cpu_blocks,
             block_size=block_size,
         )
+        """KV-Cache分块的CPU和GPU分配器"""
 
         self.block_tables: Dict[SeqId, BlockTable] = {}
+        """所有序列的KV-Cache分块表 (序列ID->分块表)"""
         self.cross_block_tables: Dict[EncoderSeqId, BlockTable] = {}
+        """用于Cross-Attention的KV-Cache分块表"""
 
         self._computed_blocks_tracker = ComputedBlocksTracker(
             self.block_allocator)
@@ -108,17 +124,21 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             self.block_allocator)
 
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
+        """判断当前序列分组是否可以进行KV-Cache的立即分配或换出到CPU或永不分配"""
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
 
+        # 检查对应encoder-decoder模型没有启用prefix-cache或者滑动窗口注意力
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
+        # 计算当前序列的提示词需要的KV-Cache分块数
         num_required_blocks = BlockTable.get_num_required_blocks(
             seq.get_token_ids(),
             block_size=self.block_size,
         )
 
+        # 对于encoder-decoder模型,需要加上encoder序列所需的分块数
         if seq_group.is_encoder_decoder():
             encoder_seq = seq_group.get_encoder_seq()
             assert encoder_seq is not None
@@ -128,6 +148,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             )
 
         if self.max_block_sliding_window is not None:
+            # 启用滑动窗口时,所需的分块最多为max_block_sliding_window
             num_required_blocks = min(num_required_blocks,
                                       self.max_block_sliding_window)
 
@@ -137,13 +158,17 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         # Use watermark to avoid frequent cache eviction.
         if (self.num_total_gpu_blocks - num_required_blocks <
                 self.watermark_blocks):
+            # 分配后剩余的总GPU分块低于水位线,则不会给改序列分组分配GPU分块
             return AllocStatus.NEVER
         if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
+            # 分配后剩余的可用GPU分块高于水位线,则可以直接分配GPU分块
             return AllocStatus.OK
         else:
+            # 分配后剩余的可用GPU分块低于水位线,则可以之后再分配GPU分块
             return AllocStatus.LATER
 
     def _allocate_sequence(self, seq: Sequence) -> BlockTable:
+        """为序列分配KV-Cache分块表"""
         block_table = BlockTable(
             block_size=self.block_size,
             block_allocator=self.block_allocator,
@@ -154,6 +179,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         return block_table
 
     def allocate(self, seq_group: SequenceGroup) -> None:
+        """为序列分组分配对应的KV-Cache分块表"""
 
         # Allocate self-attention block tables for decoder sequences
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
@@ -164,14 +190,17 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         # prompt.
         seq = waiting_seqs[0]
         block_table: BlockTable = self._allocate_sequence(seq)
+        # 记录当前序列对应的分块表
         self.block_tables[seq.seq_id] = block_table
 
         # Track seq
+        # 添加对序列的计算跟踪和最近访问跟踪
         self._computed_blocks_tracker.add_seq(seq.seq_id)
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
 
         # Assign the block table for each sequence.
         for seq in waiting_seqs[1:]:
+            # 复制指向相同物理分块的分块表
             self.block_tables[seq.seq_id] = block_table.fork()
 
             # Track seq
@@ -191,6 +220,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
 
         if seq_group.is_encoder_decoder():
+            # 为encoder序列分配KV-Cache分块表
             encoder_seq = seq_group.get_encoder_seq()
             assert encoder_seq is not None
             block_table = self._allocate_sequence(encoder_seq)
@@ -214,6 +244,11 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             block_table = self.block_tables[seq.seq_id]
 
+            # 添加token涉及的分块数
+            # 注:这里包括了最后一个可能已经使用了存了部分token的分块,
+            #    因此这里是"touched",实际需要额外分配的分块数可能是num_touched_blocks-1
+            #    此处用num_touched_blocks判断能否添加,是"worst-case",
+            #    即最坏情况下的考虑
             num_touched_blocks += (
                 block_table.get_num_blocks_touched_by_append_slots(
                     token_ids=block_table.get_unseen_token_ids(
@@ -230,19 +265,35 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         seq: Sequence,
         num_lookahead_slots: int,
     ) -> List[Tuple[int, int]]:
+        """
+        向目标序列的KV-Cache分块表中添加token槽
+
+        将目标序列上一次迭代新算出的还未添加到分块表中的token添加到该序列的分块表中,
+        过程中可能会有新的KV-Cache分块的分配,在添加过程中也会记录涉及的物理分块的COW操作
+
+        Args:
+            seq (Sequence): 目标序列
+            num_lookahead_slots (int): 投机解码所需的token槽
+
+        Returns:
+            List[Tuple[int, int]]: 添加token槽过程中产生的COW操作(源物理分块ID,目标物理分块ID)元组的列表
+        """
 
         block_table = self.block_tables[seq.seq_id]
 
+        # 向序列的分块表中添加还未存入的token(上一次迭代算出)
         block_table.append_token_ids(
             token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
             num_lookahead_slots=num_lookahead_slots,
             num_computed_slots=seq.data.get_num_computed_tokens(),
         )
         # Return any new copy-on-writes.
+        # 所有的COW操作记录
         new_cows = self.block_allocator.clear_copy_on_writes()
         return new_cows
 
     def free(self, seq: Sequence) -> None:
+        """释放序列的KV-Cache分块列表"""
         seq_id = seq.seq_id
 
         if seq_id not in self.block_tables:
@@ -251,6 +302,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
 
         # Update seq block ids with the latest access time
         self._last_access_blocks_tracker.update_seq_blocks_last_access(
+            # 序列ID及序列对应的物理分块ID列表
             seq_id, self.block_tables[seq.seq_id].physical_block_ids)
 
         # Untrack seq
@@ -258,6 +310,7 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         self._computed_blocks_tracker.remove_seq(seq_id)
 
         # Free table/blocks
+        # 释放序列的KV-Cache分块列表并移除引用
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
 
@@ -270,10 +323,12 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         del self.cross_block_tables[request_id]
 
     def get_block_table(self, seq: Sequence) -> List[int]:
+        """获取序列的物理分块ID列表"""
         block_ids = self.block_tables[seq.seq_id].physical_block_ids
         return block_ids  # type: ignore
 
     def get_cross_block_table(self, seq_group: SequenceGroup) -> List[int]:
+        """获取序列分组的Cross-Attention物理分块ID列表"""
         request_id = seq_group.request_id
         assert request_id in self.cross_block_tables
         block_ids = self.cross_block_tables[request_id].physical_block_ids
@@ -322,10 +377,12 @@ class BlockSpaceManagerV2(BlockSpaceManager):
             computed_seq_block_ids)  # type: ignore
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
+        """复刻父序列的KV-Cache分块表到子序列"""
         if parent_seq.seq_id not in self.block_tables:
             # Parent sequence has either been freed or never existed.
             return
         src_block_table = self.block_tables[parent_seq.seq_id]
+        # 复刻分块表
         self.block_tables[child_seq.seq_id] = src_block_table.fork()
 
         # Track child seq

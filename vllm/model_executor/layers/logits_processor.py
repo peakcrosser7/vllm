@@ -34,15 +34,20 @@ class LogitsProcessor(nn.Module):
         """
         super().__init__()
         self.scale = scale
+        """logits放缩系数"""
         self.vocab_size = vocab_size
+        """词汇表大小"""
         # Whether the input is logits (default is hidden states).
         self.logits_as_input = logits_as_input
+        """是否输入是logits(默认是hidden-states)"""
         # original vocabulary size (without LoRA).
         self.org_vocab_size = org_vocab_size or vocab_size
+        """原本不采用LoRA时的词汇表大小"""
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_gather = not current_platform.is_tpu()
+        """是否使用Gather或All-Gather收集logits"""
 
     def forward(
         self,
@@ -79,7 +84,9 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
+        """获取logits"""
         # Get the logits for the next tokens.
+        # 计算logits
         logits = lm_head.linear_method.apply(lm_head,
                                              hidden_states,
                                              bias=embedding_bias)
@@ -109,6 +116,7 @@ def _prune_hidden_states(
     hidden_states: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    """缩减hidden-states保留用于logits计算的token"""
     return hidden_states.index_select(0,
                                       sampling_metadata.selected_token_indices)
 
@@ -117,6 +125,7 @@ def _apply_logits_processors(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    """根据先前生成的token对logits进行处理"""
     found_logits_processors = False
     logits_processed = 0
     for seq_group in sampling_metadata.seq_groups:
@@ -126,12 +135,14 @@ def _apply_logits_processors(
         if logits_processors:
             found_logits_processors = True
 
+            # 对每个需要采样的token的logits进行处理
             for seq_id, logits_row_idx in zip(seq_ids,
                                               seq_group.sample_indices):
                 logits_row = logits[logits_row_idx]
                 past_tokens_ids = seq_group.seq_data[seq_id].output_token_ids
                 prompt_tokens_ids = seq_group.seq_data[seq_id].prompt_token_ids
 
+                # 使用每个logits处理器进行处理
                 for logits_processor in logits_processors:
                     parameters = inspect.signature(logits_processor).parameters
                     if len(parameters) == 3:

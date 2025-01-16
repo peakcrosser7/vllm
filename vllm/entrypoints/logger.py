@@ -15,6 +15,7 @@ class RequestLogger:
         super().__init__()
 
         self.max_log_len = max_log_len
+        """日志记录长度上限"""
 
     def log_inputs(
         self,
@@ -25,6 +26,7 @@ class RequestLogger:
         lora_request: Optional[LoRARequest],
         prompt_adapter_request: Optional[PromptAdapterRequest],
     ) -> None:
+        """日志记录请求的输入信息"""
         max_log_len = self.max_log_len
         if max_log_len is not None:
             if prompt is not None:

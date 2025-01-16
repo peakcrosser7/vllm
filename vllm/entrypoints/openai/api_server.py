@@ -23,7 +23,7 @@ from starlette.routing import Mount
 from typing_extensions import assert_never
 
 import vllm.envs as envs
-from vllm.config import ModelConfig
+from vllm.config import EngineConfig, ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
@@ -122,9 +122,10 @@ async def build_async_engine_client_from_engine_args(
 
     # Fall back
     # TODO: fill out feature matrix.
+    # 不支持MQLLMEngine或禁用了前端多进程时 -> 使用Ray或单进程多线程AsyncLLMEngine
     if (MQLLMEngineClient.is_unsupported_config(engine_args)
             or disable_frontend_multiprocessing):
-        engine_config = engine_args.create_engine_config()
+        engine_config: EngineConfig = engine_args.create_engine_config()
         uses_ray = getattr(AsyncLLMEngine._get_executor_cls(engine_config),
                            "uses_ray", False)
 
@@ -136,6 +137,7 @@ async def build_async_engine_client_from_engine_args(
             # Must run in main thread with ray for its signal handlers to work
             engine_client = build_engine()
         else:
+            # 获取事件循环并在默认线程池执行器中执行`build_engine()`
             engine_client = await asyncio.get_running_loop().run_in_executor(
                 None, build_engine)
 
@@ -143,6 +145,7 @@ async def build_async_engine_client_from_engine_args(
         return
 
     # Otherwise, use the multiprocessing AsyncLLMEngine.
+    # 使用多进程MQLLMEngine
     else:
         if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
             # Make TemporaryDirectory for prometheus multiprocessing
@@ -169,6 +172,7 @@ async def build_async_engine_client_from_engine_args(
         # so we need to spawn a new process
         context = multiprocessing.get_context("spawn")
 
+        # MQLLMEngine服务端进程
         engine_process = context.Process(target=run_mp_engine,
                                          args=(engine_args,
                                                UsageContext.OPENAI_API_SERVER,
@@ -180,9 +184,11 @@ async def build_async_engine_client_from_engine_args(
         # NOTE: Actually, this is not true yet. We still need to support
         # embedding models via RPC (see TODO above)
         engine_config = engine_args.create_engine_config()
+        # MQLLMEngine客户端(在当前进程)
         mp_engine_client = MQLLMEngineClient(ipc_path, engine_config)
 
         try:
+            # 轮询至服务端就绪或出现超时异常
             while True:
                 try:
                     await mp_engine_client.setup()
@@ -193,7 +199,8 @@ async def build_async_engine_client_from_engine_args(
                             "Engine process failed to start") from None
 
             yield mp_engine_client  # type: ignore[misc]
-        finally:
+        finally:    
+            # 客户端终止时的相关操作
             # Ensure rpc server process was terminated
             engine_process.terminate()
 
@@ -320,6 +327,7 @@ async def create_chat_completion(request: ChatCompletionRequest,
     elif isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())
 
+    # elif isinstance(generator, AsyncGenerator):
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
@@ -406,6 +414,7 @@ if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
 
 
 def build_app(args: Namespace) -> FastAPI:
+    """构建FastAPI服务端应用"""
     if args.disable_fastapi_docs:
         app = FastAPI(openapi_url=None,
                       docs_url=None,
@@ -467,6 +476,7 @@ def init_app_state(
     state: State,
     args: Namespace,
 ) -> None:
+    """初始化FastAPI应用的状态成员"""
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
@@ -485,6 +495,7 @@ def init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
 
+    # OpenAI对话服务对象
     state.openai_serving_chat = OpenAIServingChat(
         engine_client,
         model_config,
@@ -526,6 +537,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     logger.info("vLLM API server version %s", VLLM_VERSION)
     logger.info("args: %s", args)
 
+    # 创建IPv4的TCP套接字并绑定端口
     temp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     temp_socket.bind(("", args.port))
 
@@ -533,9 +545,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
         # Interrupt server on sigterm while initializing
         raise KeyboardInterrupt("terminated")
 
+    # 注册处理SIGTERM信号的信号处理函数
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # 构建LLMEngine客户端(以及服务端)并进行初始化
     async with build_async_engine_client(args) as engine_client:
+        # FastAPI服务端应用
         app = build_app(args)
 
         model_config = await engine_client.get_model_config()

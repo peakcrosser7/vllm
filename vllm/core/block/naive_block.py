@@ -38,15 +38,20 @@ class NaiveBlockAllocator(BlockAllocator):
             block_ids = range(num_blocks)
 
         self._free_block_indices: Deque[BlockId] = deque(block_ids)
+        """未使用的KV-Cache物理分块的索引的双端队列"""
         self._all_block_indices = frozenset(block_ids)
+        """所有KV-Cache物理分块的索引的集合"""
         assert len(self._all_block_indices) == num_blocks
 
         self._refcounter = RefCounter(
             all_block_indices=self._free_block_indices)
+        """KV-Cache物理分块的引用计数器"""
         self._block_size = block_size
+        """KV-Cache分块大小"""
 
         self._cow_tracker = CopyOnWriteTracker(
             refcounter=self._refcounter.as_readonly())
+        """写时复制跟踪器"""
 
         if block_pool is None:
             extra_factor = 4
@@ -55,6 +60,7 @@ class NaiveBlockAllocator(BlockAllocator):
             # than physical blocks
             self._block_pool = BlockPool(self._block_size, create_block, self,
                                          num_blocks * extra_factor)
+            """KV-Cache逻辑分块池"""
         else:
             # In this case, the block pool is provided by the caller,
             # which means that there is most likely a need to share
@@ -87,6 +93,20 @@ class NaiveBlockAllocator(BlockAllocator):
             prev_block: Optional[Block],
             block_token_ids: List[List[int]],
             device: Optional[Device] = None) -> List[Block]:
+        """Allocates a new group of immutable blocks with the provided block 
+        token IDs on the specified device.
+
+        Args:
+            prev_block (Optional[Block]): The previous block in the sequence.
+                Used for prefix hashing.
+            block_token_ids (List[int]): The list of block token IDs to be 
+                stored in the new blocks.
+            device (Device): The device on which to allocate the new block.
+
+        Returns:
+            List[Block]: The newly allocated list of immutable blocks 
+                containing the provided block token IDs.
+        """
         assert device is None
         num_blocks = len(block_token_ids)
 
@@ -127,6 +147,8 @@ class NaiveBlockAllocator(BlockAllocator):
         return block
 
     def _allocate_block_id(self) -> BlockId:
+        """分配一个KV-Cache物理分块ID"""
+        # 如果没有可以的物理分块ID则返回错误
         if not self._free_block_indices:
             raise BlockAllocator.NoFreeBlocksError()
 
@@ -135,20 +157,25 @@ class NaiveBlockAllocator(BlockAllocator):
         return block_id
 
     def _free_block_id(self, block: Block) -> None:
+        """释放分块的物理分块ID (引用计数-1)"""
+        # 分块的物理块ID
         block_id = block.block_id
         assert block_id is not None
 
         refcount = self._refcounter.decr(block_id)
+        # 引用计数为0则将该物理分块ID放回空闲分块队列中
         if refcount == 0:
             self._free_block_indices.appendleft(block_id)
 
         block.block_id = None
 
     def free(self, block: Block, keep_block_object: bool = False) -> None:
+        """释放KV-Cache分块"""
         # Release the physical block id
         self._free_block_id(block)
 
         # Release the block object
+        # 如果不保留逻辑分块对象则放回分块池中
         if not keep_block_object:
             self._block_pool.free_block(block)
 
@@ -163,7 +190,8 @@ class NaiveBlockAllocator(BlockAllocator):
             List[Block]: The new sequence of blocks that shares the same memory
                 as the original sequence.
         """
-        source_blocks = get_all_blocks_recursively(last_block)
+        # last_block为尾分块的序列的分块列表
+        source_blocks: List[Block] = get_all_blocks_recursively(last_block)
 
         forked_blocks: List[Block] = []
         prev_block = None
@@ -171,9 +199,11 @@ class NaiveBlockAllocator(BlockAllocator):
 
             # Increment refcount for each block.
             assert block.block_id is not None
+            # 增加逻辑分块对应的物理分块的引用计数
             refcount = self._refcounter.incr(block.block_id)
             assert refcount != 1, "can't fork free'd block"
 
+            # 创建指向相同物理分块的逻辑分块
             forked_block = self._block_pool.init_block(
                 prev_block=prev_block,
                 token_ids=block.token_ids,
@@ -186,6 +216,7 @@ class NaiveBlockAllocator(BlockAllocator):
         return forked_blocks
 
     def get_num_free_blocks(self) -> int:
+        """获取未使用的分块数"""
         return len(self._free_block_indices)
 
     def get_num_total_blocks(self) -> int:
@@ -210,6 +241,7 @@ class NaiveBlockAllocator(BlockAllocator):
 
     @property
     def all_block_ids(self) -> FrozenSet[int]:
+        """所有KV-Cache分块索引的集合"""
         return self._all_block_indices
 
     def cow_block_if_not_appendable(self, block: Block) -> BlockId:
@@ -227,12 +259,15 @@ class NaiveBlockAllocator(BlockAllocator):
         src_block_id = block.block_id
         assert src_block_id is not None
 
+        # 若当前分块可以共享则直接返回其物理分块ID
         if self._cow_tracker.is_appendable(block):
             return src_block_id
 
-        self._free_block_id(block)
+        # 不可共享
+        self._free_block_id(block)  # 引用计数-1
         trg_block_id = self._allocate_block_id()
 
+        # 记录一次COW操作
         self._cow_tracker.record_cow(src_block_id, trg_block_id)
 
         return trg_block_id
@@ -375,11 +410,15 @@ class NaiveBlock(Block):
                  block_id: Optional[int] = None,
                  _cow_target: Optional[Block] = None):
         self._token_ids: List[int] = []
+        """逻辑分块内的token-ID列表"""
         self._block_size = block_size
+        """KV-Cache分块大小"""
         self._prev_block = prev_block
         self._block_id = block_id
+        """当前逻辑分块对应的物理分块的索引"""
         self._allocator = allocator
         self._cow_target = _cow_target if _cow_target is not None else self
+        """COW的目标分块"""
 
         self._append_token_ids_no_cow(token_ids)
 
@@ -394,6 +433,7 @@ class NaiveBlock(Block):
         self._append_token_ids_no_cow(token_ids)
 
         if self._block_id is not None:
+            # 更新逻辑分块的物理分块ID(可能发生COW映射到新的物理分块)
             self._block_id = (self._allocator.cow_block_if_not_appendable(
                 self._cow_target))
 
@@ -440,6 +480,7 @@ class NaiveBlock(Block):
 
     @property
     def num_empty_slots(self) -> int:
+        """当前分块中的空token槽数"""
         return self._block_size - len(self.token_ids)
 
     @property

@@ -83,6 +83,7 @@ class ParsedTokensPrompt(TypedDict):
 def parse_singleton_prompt(
     inputs: SingletonPromptInputs,
 ) -> Union[ParsedStrPrompt, ParsedTextPrompt, ParsedTokensPrompt]:
+    """解析单个提示词为相应类型的ParsedPrompt对象"""
     if isinstance(inputs, str):
         return ParsedStrPrompt(type="str", content=inputs)
     elif isinstance(inputs, dict):

@@ -135,6 +135,8 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
 def enable_trace_function_call(log_file_path: str,
                                root_dir: Optional[str] = None):
     """
+    启用函数跟踪回调函数
+
     Enable tracing of every function call in code under `root_dir`.
     This is useful for debugging hangs or crashes.
     `log_file_path` is the path to the log file.

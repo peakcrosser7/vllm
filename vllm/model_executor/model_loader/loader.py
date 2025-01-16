@@ -154,6 +154,8 @@ def build_model(model_class: Type[nn.Module], hf_config: PretrainedConfig,
                 lora_config: Optional[LoRAConfig],
                 multimodal_config: Optional[MultiModalConfig],
                 scheduler_config: Optional[SchedulerConfig]) -> nn.Module:
+    """构建模型对象"""
+    # 模型额外参数(如LoRA配置,多模态配置等)
     extra_kwargs = _get_model_initialization_kwargs(model_class, lora_config,
                                                     multimodal_config,
                                                     scheduler_config)
@@ -261,7 +263,19 @@ class DefaultModelLoader(BaseModelLoader):
                          fall_back_to_pt: bool) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
-        If the model is not local, it will be downloaded."""
+        If the model is not local, it will be downloaded.
+
+        Args:
+            model_name_or_path (str): 模型名称或模型本地路径
+            revision (Optional[str]): 模型版本号
+            fall_back_to_pt (bool): 是否回退到使用.pt格式权重
+
+        Returns:
+            (str, List[str], bool): 
+                str: 模型本地路径  
+                List[str]: 模型权重文件列表  
+                bool: 是否使用.safetensors格式权重
+        """
         model_name_or_path = self._maybe_download_from_modelscope(
             model_name_or_path, revision) or model_name_or_path
 
@@ -396,15 +410,18 @@ class DefaultModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                # 构建并初始化模型
                 model = _initialize_model(model_config, self.load_config,
                                           lora_config, cache_config,
                                           scheduler_config)
 
+            # 加载模型权重
             model.load_weights(self._get_all_weights(model_config, model))
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
+                    # 在加载权重之后执行量化算法的处理
                     # When quant methods need to process weights after loading
                     # (for repacking, quantizing, etc), they expect parameters
                     # to be on the global target device. This scope is for the

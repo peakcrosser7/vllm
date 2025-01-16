@@ -101,11 +101,15 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
             Device.CPU: cpu_block_allocator,
             Device.GPU: gpu_block_allocator,
         }
+        """CPU和GPU的KV-Cache物理分块分配器"""
 
         self._swap_mapping: Dict[int, int] = {}
         self._null_block: Optional[Block] = None
+        """空分块(用于占位)"""
 
         self._block_ids_to_allocator: Dict[int, BlockAllocator] = {}
+        """KV-Cache分块索引 -> 分块内存分配器"""
+        # 设置每个分块对应的CPU或GPU分配器
         for _, allocator in self._allocators.items():
             for block_id in allocator.all_block_ids:
                 self._block_ids_to_allocator[block_id] = allocator
@@ -200,6 +204,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         block_id = last_block.block_id
         assert block_id is not None
         allocator = self._block_ids_to_allocator[block_id]
+        # 复制出指向相同物理分块的逻辑分块
         return allocator.fork(last_block)
 
     def get_num_free_blocks(self, device: Device) -> int:

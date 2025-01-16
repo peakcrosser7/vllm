@@ -15,6 +15,7 @@ def get_model(*, model_config: ModelConfig, load_config: LoadConfig,
               scheduler_config: SchedulerConfig,
               lora_config: Optional[LoRAConfig],
               cache_config: CacheConfig) -> nn.Module:
+    """构建模型并加载权重"""
     loader = get_model_loader(load_config)
     return loader.load_model(model_config=model_config,
                              device_config=device_config,

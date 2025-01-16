@@ -275,13 +275,17 @@ class PyObjectCache:
 
     def __init__(self, obj_builder):
         self._obj_builder = obj_builder
+        """对象构造器"""
         self._index = 0
+        """缓存对象索引"""
 
         self._obj_cache = []
+        """对象缓存列表"""
         for _ in range(128):
             self._obj_cache.append(self._obj_builder())
 
     def _grow_cache(self):
+        """扩容对象缓存列表"""
         # Double the size of the cache
         num_objs = len(self._obj_cache)
         for _ in range(num_objs):
@@ -295,6 +299,7 @@ class PyObjectCache:
             self._grow_cache()
             assert self._index < len(self._obj_cache)
 
+        # 返回一个缓存对象并将索引+1
         obj = self._obj_cache[self._index]
         self._index += 1
 
@@ -330,6 +335,7 @@ def is_openvino() -> bool:
 
 @lru_cache(maxsize=None)
 def is_neuron() -> bool:
+    """是否是AWS Neuron环境"""
     try:
         import transformers_neuronx
     except ImportError:
@@ -439,10 +445,12 @@ async def iterate_with_cancellation(
     """
 
     # Can use anext() in python >= 3.10
+    # 将生成器转换为异步Future对象
     awaits = [ensure_future(iterator.__anext__())]
     while True:
+        # 等待生成结果
         done, pending = await asyncio.wait(awaits, timeout=1)
-        if await is_cancelled():
+        if await is_cancelled():    # 任务取消
             with contextlib.suppress(BaseException):
                 awaits[0].cancel()
                 await iterator.aclose()
@@ -502,6 +510,7 @@ async def merge_async_iterators(
 
 
 def get_ip() -> str:
+    """获得当前节点的IP地址"""
     host_ip = envs.VLLM_HOST_IP
     if host_ip:
         return host_ip
@@ -543,17 +552,21 @@ def is_valid_ipv6_address(address: str) -> bool:
 
 
 def get_distributed_init_method(ip: str, port: int) -> str:
+    """返回分布式tcp://ip:port的IP地址端口号的字符串"""
+    # 使用":"区分IPv6或IPv4,对于IPv6则IP外侧用中括号包裹
     # Brackets are not permitted in ipv4 addresses,
     # see https://github.com/python/cpython/issues/103848
     return f"tcp://[{ip}]:{port}" if ":" in ip else f"tcp://{ip}:{port}"
 
 
 def get_open_zmq_ipc_path() -> str:
+    """获取用于ZeroMQ的IPC路径"""
     base_rpc_path = envs.VLLM_RPC_BASE_PATH
     return f"ipc://{base_rpc_path}/{uuid4()}"
 
 
 def get_open_port() -> int:
+    """获取可用端口号"""
     port = envs.VLLM_PORT
     if port is not None:
         while True:
@@ -749,6 +762,7 @@ def print_warning_once(msg: str) -> None:
 
 @lru_cache(maxsize=None)
 def is_pin_memory_available() -> bool:
+    """是否支持锁页内存"""
 
     if in_wsl():
         # Pinning memory in WSL is not supported.
@@ -773,6 +787,7 @@ class DeviceMemoryProfiler:
         self.device = device
 
     def current_memory_usage(self) -> float:
+        """当前使用的设备显存大小(单位:B)"""
         # Return the memory usage in bytes.
         if current_platform.is_cuda_alike():
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -789,6 +804,7 @@ class DeviceMemoryProfiler:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.final_memory = self.current_memory_usage()
+        # 作用域前后消耗的内存大小
         self.consumed_memory = self.final_memory - self.initial_memory
 
         # Force garbage collection
@@ -934,6 +950,8 @@ def flatten_2d_lists(lists: List[List[T]]) -> List[T]:
 
 def init_cached_hf_modules() -> None:
     """
+    惰性初始化HuggingFace模块并设置模型缓存目录
+
     Lazy initialization of the Hugging Face modules.
     """
     from transformers.dynamic_module_utils import init_hf_modules
@@ -1094,11 +1112,14 @@ def weak_bind(bound_method: Callable[..., Any], ) -> Callable[..., None]:
     """Make an instance method that weakly references
     its associated instance and no-ops once that
     instance is collected."""
+    # `__self__`:获取方法绑定的实例对象
     ref = weakref.ref(bound_method.__self__)  # type: ignore[attr-defined]
+    # `__func__`:获取方法的原始函数对象(不绑定实例对象)
     unbound = bound_method.__func__  # type: ignore[attr-defined]
 
     def weak_bound(*args, **kwargs) -> None:
         if inst := ref():
+            # 调用对象及其函数方法
             unbound(inst, *args, **kwargs)
 
     return weak_bound
@@ -1243,6 +1264,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 async def _run_task_with_lock(task: Callable, lock: asyncio.Lock, *args,
                               **kwargs):
     """Utility function to run async task in a lock"""
+    # 异步锁在task执行时一直持有,直到task执行完成才会释放
     async with lock:
         return await task(*args, **kwargs)
 
@@ -1298,6 +1320,7 @@ def get_allowed_kwarg_only_overrides(
 # In particular, the FakeScalarType is not supported for earlier versions of
 # PyTorch which breaks dynamo for any ops registered using ScalarType.
 def supports_dynamo() -> bool:
+    """是否支持TorchDynamo"""
     base_torch_version = Version(Version(torch.__version__).base_version)
     return base_torch_version >= Version("2.4.0")
 

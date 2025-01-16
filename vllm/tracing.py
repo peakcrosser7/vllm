@@ -43,11 +43,13 @@ except ImportError:
 
 
 def is_otel_available() -> bool:
+    """OpenTelemetry是否可用"""
     return _is_otel_imported
 
 
 def init_tracer(instrumenting_module_name: str,
                 otlp_traces_endpoint: str) -> Optional[Tracer]:
+    """初始化追踪器"""
     if not is_otel_available():
         raise ValueError(
             "OpenTelemetry is not available. Unable to initialize "

@@ -24,8 +24,11 @@ class MQEngineDeadError(RuntimeError):
 @dataclass
 class RPCProcessRequest:
     inputs: PromptInputs
+    """提示词输入"""
     params: Union[SamplingParams, PoolingParams]
+    """采样参数"""
     request_id: str
+    """请求ID"""
     lora_request: Optional[LoRARequest] = None
     trace_headers: Optional[Mapping[str, str]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
@@ -65,6 +68,7 @@ REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCError]
 
 def ENGINE_DEAD_ERROR(
         error: Optional[BaseException] = None) -> MQEngineDeadError:
+    """返回MQEngineDeadError"""
     if error is None:
         return MQEngineDeadError(
             "Engine loop is not running. Inspect the stacktrace to "

@@ -17,9 +17,11 @@ class StopChecker:
                  get_tokenizer_for_seq: Callable[[Sequence], AnyTokenizer]):
         # Do not use it directly, but use `self._get_max_model_len`.
         self._max_model_len = max_model_len
+        """模型支持的最大序列长度(包括输入输出)"""
         self.get_tokenizer_for_seq = get_tokenizer_for_seq
 
     def _get_max_model_len(self, lora_req: Optional[LoRARequest]):
+        """获取模型支持的最大序列长度(包括输入输出)"""
         if lora_req and lora_req.long_lora_max_len:
             return lora_req.long_lora_max_len
         else:
@@ -40,10 +42,12 @@ class StopChecker:
 
         # Check if the minimum number of tokens has been generated yet;
         # skip the stop string/token checks if not
+        # 生成token数小于最小个数则跳过检查
         if seq.get_output_len() < sampling_params.min_tokens:
             return
 
         # Check if the sequence has generated the EOS token.
+        # 遇到了EOS-token
         if ((not sampling_params.ignore_eos)
                 and seq.get_last_token_id() == seq.eos_token_id):
             # Remove the last EOS token unless explicitly specified
@@ -56,17 +60,22 @@ class StopChecker:
 
         # Check if a stop token was encountered.
         # This assumes a single token produced per step.
+        # 遇到了停止生成的token-ID
         last_token_id = seq.get_last_token_id()
         if last_token_id in sampling_params.stop_token_ids:
+            # 如果此次解码出了token文本,但输出中不能包含用于停止生成的字符串
             if new_char_count and (
                     not sampling_params.include_stop_str_in_output):
                 # Remove last token
+                # 则删除新解码出的(用于停止生成的)token
                 seq.output_text = seq.output_text[:-new_char_count]
+            # 标记序列状态为停止
             seq.status = SequenceStatus.FINISHED_STOPPED
             seq.stop_reason = last_token_id
             return
 
         # Check if any stop strings are matched.
+        # 生成了用于停止生成的字符串
         stop_str = self._check_stop_strings(seq, new_char_count,
                                             sampling_params)
         if stop_str is not None:
@@ -75,11 +84,13 @@ class StopChecker:
             return
 
         # Check if the sequence has reached max_model_len.
+        # 序列总长度达到模型长度上限
         if seq.get_len() > self._get_max_model_len(lora_req):
             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
             return
 
         # Check if the sequence has reached max_tokens.
+        # 生成token达到上限
         if seq.get_output_len() == sampling_params.max_tokens:
             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
             return

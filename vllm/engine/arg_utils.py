@@ -83,82 +83,123 @@ class EngineArgs:
     """Arguments for vLLM engine."""
     model: str = 'facebook/opt-125m'
     served_model_name: Optional[Union[str, List[str]]] = None
+    """提供服务的模型名称"""
     tokenizer: Optional[str] = None
     skip_tokenizer_init: bool = False
+    """是否跳过分词器和逆分词器的初始化"""
     tokenizer_mode: str = 'auto'
+    """分词器模式"""
     trust_remote_code: bool = False
     download_dir: Optional[str] = None
+    """模型下载或加载的目录"""
     load_format: str = 'auto'
+    """模型加载格式"""
     config_format: str = 'auto'
     dtype: str = 'auto'
     kv_cache_dtype: str = 'auto'
+    """KV-Cache数据类型"""
     quantization_param_path: Optional[str] = None
     seed: int = 0
     max_model_len: Optional[int] = None
+    """模型支持的最大序列长度"""
     worker_use_ray: bool = False
+    """是否使用Ray作为worker后端"""
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
     distributed_executor_backend: Optional[Union[str,
                                                  Type[ExecutorBase]]] = None
+    """分布式模型worker后端的类型"""
     pipeline_parallel_size: int = 1
+    """流水线并行分组大小"""
     tensor_parallel_size: int = 1
+    """张量并行分组大小"""
     max_parallel_loading_workers: Optional[int] = None
+    """顺序加载模型时的最大批次数"""
     block_size: int = 16
+    """KV-Cache分块大小(包含的token数)"""
     enable_prefix_caching: bool = False
+    """是否启用提示词前缀缓存"""
     disable_sliding_window: bool = False
+    """是否禁用滑动窗口"""
     use_v2_block_manager: bool = False
     swap_space: float = 4  # GiB
+    """CPU内存交换区大小"""
     cpu_offload_gb: float = 0  # GiB
+    """用于模型权重卸载的CPU内存大小"""
     gpu_memory_utilization: float = 0.90
+    """GPU利用率:用于模型权重,激活以及KV-Cache的GPU内存比例"""
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: int = 256
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
     disable_log_stats: bool = False
+    """是否禁用状态日志打印"""
     revision: Optional[str] = None
     code_revision: Optional[str] = None
     rope_scaling: Optional[dict] = None
     rope_theta: Optional[float] = None
     tokenizer_revision: Optional[str] = None
     quantization: Optional[str] = None
+    """模型权重量化方法"""
     enforce_eager: Optional[bool] = None
     max_context_len_to_capture: Optional[int] = None
     max_seq_len_to_capture: int = 8192
+    """CUDA-Graph捕获的最大序列长度"""
     disable_custom_all_reduce: bool = False
+    """是否禁用自定义All-Reduce算子并回退到NCCL实现"""
     tokenizer_pool_size: int = 0
+    """分词器池大小(池中工作worker数)"""
     # Note: Specifying a tokenizer pool by passing a class
     # is intended for expert use only. The API may change without
     # notice.
     tokenizer_pool_type: Union[str, Type["BaseTokenizerGroup"]] = "ray"
+    """分词器池类型"""
     tokenizer_pool_extra_config: Optional[dict] = None
+    """分词器池额外配置"""
     limit_mm_per_prompt: Optional[Mapping[str, int]] = None
+    """多模态情况下每个提示词中输入实例数量上限"""
     enable_lora: bool = False
+    """是否启用LoRA"""
     max_loras: int = 1
     max_lora_rank: int = 16
     enable_prompt_adapter: bool = False
+    """是否启用提示词适配器"""
     max_prompt_adapters: int = 1
+    """PromptAdapters批次大小上限"""
     max_prompt_adapter_token: int = 0
+    """PromptAdapters分词最大数目"""
     fully_sharded_loras: bool = False
     lora_extra_vocab_size: int = 256
     long_lora_scaling_factors: Optional[Tuple[float]] = None
     lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
     max_cpu_loras: Optional[int] = None
     device: str = 'auto'
+    """GPU设备类型"""
     num_scheduler_steps: int = 1
+    """每次调度执行的步数(Multi-step)"""
     multi_step_stream_outputs: bool = False
+    """多步调度流输出"""
     ray_workers_use_nsight: bool = False
+    """是否使用Nsight对Ray worker进行分析"""
     num_gpu_blocks_override: Optional[int] = None
+    """GPU上KV-Cache分块数"""
     num_lookahead_slots: int = 0
+    """投机解码时每个序列每个step预分配的token-id槽"""
     model_loader_extra_config: Optional[dict] = None
+    """模型加载的额外配置"""
     ignore_patterns: Optional[Union[str, List[str]]] = None
+    """模型加载时忽略的模式"""
     preemption_mode: Optional[str] = None
 
     scheduler_delay_factor: float = 0.0
     enable_chunked_prefill: Optional[bool] = None
+    """是否启用chunked-prefill"""
 
     guided_decoding_backend: str = 'outlines'
+    """引导解码的后端"""
     # Speculative decoding configuration.
     speculative_model: Optional[str] = None
+    """投机解码模型名称"""
     speculative_model_quantization: Optional[str] = None
     speculative_draft_tensor_parallel_size: Optional[int] = None
     num_speculative_tokens: Optional[int] = None
@@ -174,8 +215,11 @@ class EngineArgs:
 
     otlp_traces_endpoint: Optional[str] = None
     collect_detailed_traces: Optional[str] = None
+    """收集详细信息的列表(choices=['all','model','worker'])"""
     disable_async_output_proc: bool = False
+    """是否禁用异步输出进程"""
     override_neuron_config: Optional[Dict[str, Any]] = None
+    """AWS Neuron配置"""
     mm_processor_kwargs: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
@@ -846,6 +890,7 @@ class EngineArgs:
         )
 
     def create_engine_config(self) -> EngineConfig:
+        """创建引擎配置"""
         # gguf file needs a specific model loader and doesn't use hf_repo
         if check_gguf_file(self.model):
             self.quantization = self.load_format = "gguf"
@@ -871,7 +916,7 @@ class EngineArgs:
             f", but got {self.cpu_offload_gb}")
 
         device_config = DeviceConfig(device=self.device)
-        model_config = self.create_model_config()
+        model_config: ModelConfig = self.create_model_config()
 
         if model_config.is_multimodal_model:
             if self.enable_prefix_caching:
@@ -1025,7 +1070,7 @@ class EngineArgs:
             self.model_loader_extra_config[
                 "qlora_adapter_name_or_path"] = self.qlora_adapter_name_or_path
 
-        load_config = self.create_load_config()
+        load_config: LoadConfig = self.create_load_config()
 
         prompt_adapter_config = PromptAdapterConfig(
             max_prompt_adapters=self.max_prompt_adapters,
@@ -1076,6 +1121,7 @@ class EngineArgs:
 @dataclass
 class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
+    # 是否禁用日志打印请求
     disable_log_requests: bool = False
 
     @staticmethod

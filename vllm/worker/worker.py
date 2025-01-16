@@ -65,12 +65,15 @@ class Worker(LocalOrDistributedWorkerBase):
         self.device_config = device_config
         self.cache_config = cache_config
         self.local_rank = local_rank
+        """本地rank号"""
         self.rank = rank
+        """总rank号"""
         self.distributed_init_method = distributed_init_method
         self.lora_config = lora_config
         self.load_config = load_config
         self.prompt_adapter_config = prompt_adapter_config
         self.is_driver_worker = is_driver_worker
+        """是否是TP主worker (非并行worker或worker的TP-rank为0)"""
         if parallel_config and is_driver_worker:
             assert rank % parallel_config.tensor_parallel_size == 0, \
                    "Driver worker should be rank 0 of tensor parallel group."
@@ -151,6 +154,7 @@ class Worker(LocalOrDistributedWorkerBase):
         return self.model_config.is_embedding_model
 
     def init_device(self) -> None:
+        """初始化设备环境"""
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -163,12 +167,14 @@ class Worker(LocalOrDistributedWorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             self.device = torch.device(f"cuda:{self.local_rank}")
+            """带rank的CUDA-GPU"""
             torch.cuda.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
-            gc.collect()
-            torch.cuda.empty_cache()
+            gc.collect()    # 启动垃圾回收
+            torch.cuda.empty_cache()    # 清空torch缓存
             self.init_gpu_memory = torch.cuda.mem_get_info()[0]
+            """GPU初始可用显存大小"""
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
@@ -266,18 +272,23 @@ class Worker(LocalOrDistributedWorkerBase):
         self._warm_up_model()
 
     def _init_cache_engine(self):
+        """初始化KV-Cache管理器并分配KV-Cache空间"""
         assert self.cache_config.num_gpu_blocks is not None
-        self.cache_engine = [
+        # 每个PP-rank的虚拟引擎有一个独立的CacheEngine
+        self.cache_engine: List[CacheEngine] = [
             CacheEngine(self.cache_config, self.model_config,
                         self.parallel_config, self.device_config)
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
-        self.gpu_cache = [
+        """KV-Cache管理器的列表"""
+        self.gpu_cache: List[List[torch.Tensor]] = [
             self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
         ]
+        """KV-Cache列表"""
 
     def _warm_up_model(self) -> None:
+        """预热模型 (进行CUDA-Graph模型捕获以及重置随机数种子)"""
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model(self.gpu_cache)
         # Reset the seed to ensure that the random state is not affected by
@@ -286,6 +297,8 @@ class Worker(LocalOrDistributedWorkerBase):
 
     @property
     def do_metadata_broadcast(self) -> bool:
+        """是否进行元数据广播"""
+        # TP > 1
         return self.parallel_config.tensor_parallel_size > 1
 
     @property
@@ -295,6 +308,7 @@ class Worker(LocalOrDistributedWorkerBase):
     @torch.inference_mode()
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        """准备worker输入"""
         virtual_engine = execute_model_req.virtual_engine
         num_steps = execute_model_req.num_steps
         num_seq_groups = len(execute_model_req.seq_group_metadata_list)
@@ -326,6 +340,7 @@ class Worker(LocalOrDistributedWorkerBase):
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
+        # 进行KV-Cache分块的换入,换出,拷贝
         if (worker_input.blocks_to_swap_in is not None
                 and worker_input.blocks_to_swap_in.numel() > 0):
             self.cache_engine[virtual_engine].swap_in(
@@ -472,8 +487,8 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
                 "`dtype` flag in CLI, for example: --dtype=half.")
 
 
-def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
-                                max_model_len) -> None:
+def raise_if_cache_size_invalid(num_gpu_blocks: int, block_size: int,
+                                max_model_len: int) -> None:
     if num_gpu_blocks <= 0:
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "

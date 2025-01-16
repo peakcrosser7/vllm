@@ -35,6 +35,7 @@ from vllm.entrypoints.openai.tool_parsers import (Hermes2ProToolParser,
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import Logprob
 from vllm.tracing import (contains_trace_headers, extract_trace_headers,
                           log_tracing_disabled_warning)
@@ -68,6 +69,7 @@ class OpenAIServingChat(OpenAIServing):
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
 
         self.response_role = response_role
+        """服务响应时的角色"""
         self.use_tool_use_model_template = False
         self.chat_template = load_chat_template(chat_template)
 
@@ -129,7 +131,7 @@ class OpenAIServingChat(OpenAIServing):
                 tool.model_dump() for tool in request.tools
             ]
 
-            prompt: Union[str, List[int]]
+            prompt: Union[str, List[int]]   # 提示词
             is_mistral_tokenizer = isinstance(tokenizer, MistralTokenizer)
             if is_mistral_tokenizer:
                 prompt = apply_mistral_chat_template(
@@ -175,6 +177,7 @@ class OpenAIServingChat(OpenAIServing):
                 "\"auto\" tool choice requires "
                 "--enable-auto-tool-choice and --tool-call-parser to be set")
 
+        # 生成一个随机的请求ID
         request_id = f"chat-{random_uuid()}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -186,7 +189,7 @@ class OpenAIServingChat(OpenAIServing):
                 await self._guided_decode_logits_processor(request, tokenizer))
 
             if isinstance(prompt, str):
-                prompt_inputs = self._tokenize_prompt_input(
+                prompt_inputs: TextTokensPrompt = self._tokenize_prompt_input(
                     request,
                     tokenizer,
                     prompt,
@@ -202,7 +205,7 @@ class OpenAIServingChat(OpenAIServing):
 
             assert prompt_inputs is not None
 
-            sampling_params = request.to_sampling_params(
+            sampling_params: SamplingParams = request.to_sampling_params(
                 tokenizer,
                 guided_decode_logits_processor,
                 default_max_tokens=self.max_model_len -
@@ -228,6 +231,7 @@ class OpenAIServingChat(OpenAIServing):
                     and contains_trace_headers(raw_request.headers)):
                 log_tracing_disabled_warning()
 
+            # 调用LLMEngine客户端进行对话文本生成
             result_generator = self.engine_client.generate(
                 engine_inputs,
                 sampling_params,
@@ -244,7 +248,7 @@ class OpenAIServingChat(OpenAIServing):
             result_generator = iterate_with_cancellation(
                 result_generator, raw_request.is_disconnected)
 
-        # Streaming response
+        # Streaming response 启用流式响应
         if request.stream:
             return self.chat_completion_stream_generator(
                 request, result_generator, request_id, conversation, tokenizer,
@@ -259,6 +263,7 @@ class OpenAIServingChat(OpenAIServing):
             return self.create_error_response(str(e))
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
+        """返回服务处理对换请求时的角色"""
         if request.add_generation_prompt:
             return self.response_role
         return request.messages[-1]["role"]
@@ -306,6 +311,7 @@ class OpenAIServingChat(OpenAIServing):
             previous_texts, all_previous_token_ids = None, None
 
         try:
+            # 异步遍历结果生成器的每个输出结果
             async for res in result_generator:
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
@@ -395,7 +401,9 @@ class OpenAIServingChat(OpenAIServing):
                                     exclude_unset=True)
                                 yield f"data: {data}\n\n"
                     first_iteration = False
+                # endif first_iteration
 
+                # 遍历输出序列
                 for output in res.outputs:
                     i = output.index
 

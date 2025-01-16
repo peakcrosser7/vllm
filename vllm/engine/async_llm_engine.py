@@ -18,6 +18,7 @@ from vllm.executor.executor_base import ExecutorAsyncBase
 from vllm.executor.gpu_executor import GPUExecutorAsync
 from vllm.executor.ray_utils import initialize_ray_cluster
 from vllm.inputs import PromptInputs
+from vllm.inputs.data import EncoderDecoderLLMInputs, LLMInputs
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -75,12 +76,16 @@ class AsyncStream:
 
     def __init__(self, request_id: str, cancel: Callable[[str], None]) -> None:
         self.request_id = request_id
+        """请求ID"""
         self._cancel = cancel
         self._queue: asyncio.Queue = asyncio.Queue()
+        """请求输出的异步队列"""
         self._finished = False
+        """请求输出的异步流是否已完成"""
 
     def put(self, item: Union[RequestOutput, EmbeddingRequestOutput,
                               Exception]) -> None:
+        """将请求的输出结果放入异步队列"""
         if not self._finished:
             self._queue.put_nowait(item)
 
@@ -88,6 +93,7 @@ class AsyncStream:
         self,
         exception: Optional[Union[BaseException, Type[BaseException]]] = None,
     ) -> None:
+        """标记请求输出的异步流已完成"""
         if not self._finished:
             self._finished = True
             self._queue.put_nowait(
@@ -114,6 +120,7 @@ class AsyncStream:
 
     @staticmethod
     def _is_raisable(value: Any):
+        """提供的值是不是可以抛出的异常"""
         return isinstance(value, BaseException) or \
                 (isinstance(value, type) and \
                  issubclass(value, BaseException))
@@ -124,10 +131,14 @@ class RequestTracker:
 
     def __init__(self) -> None:
         self._request_streams: Dict[str, AsyncStream] = {}
+        """请求ID-异步流的映射字典"""
         self._aborted_requests: asyncio.Queue[str] = asyncio.Queue()
+        """存放终止请求的异步队列"""
         self._new_requests: asyncio.Queue[Tuple[AsyncStream,
                                                 dict]] = asyncio.Queue()
+        """存放新请求的异步队列"""
         self.new_requests_event = asyncio.Event()
+        """新请求到达的异步事件"""
 
     def __contains__(self, item):
         return item in self._request_streams
@@ -158,14 +169,18 @@ class RequestTracker:
         finished = request_output.finished
 
         if finished:
-            stream = self._request_streams.pop(request_id, None)
+            # 请求已完成则从请求ID-异步流的映射字典获取并移除异步流
+            stream: Optional[AsyncStream] = self._request_streams.pop(request_id, None)
         else:
-            stream = self._request_streams.get(request_id)
+            # 请求未完成则只从请求ID-异步流的映射字典获取异步流不移除
+            stream: AsyncStream = self._request_streams.get(request_id)
         # Guard against a KeyError which can occur if the request was aborted
         # while the output was generated
         if stream is not None:
+            # 将请求结果放入异步流队列中
             stream.put(request_output)
             if finished:
+                # 标记异步流已完成
                 stream.finish()
 
         if verbose and finished:
@@ -193,11 +208,13 @@ class RequestTracker:
 
         abort_request = partial(self.abort_request, verbose=verbose)
         stream = AsyncStream(request_id, abort_request)
+        # 将请求入队异步队列
         self._new_requests.put_nowait((stream, {
             "request_id": request_id,
             **engine_add_request_kwargs
         }))
 
+        # 新请求到达的事件置True
         self.new_requests_event.set()
 
         if verbose:
@@ -227,29 +244,38 @@ class RequestTracker:
         new_requests: List[Dict] = []
         finished_requests: Set[str] = set()
 
+        # 终止请求队列不为空
         while not self._aborted_requests.empty():
             request_id = self._aborted_requests.get_nowait()
             finished_requests.add(request_id)
 
+        # 新请求队列不为空
         while not self._new_requests.empty():
             stream, new_request = self._new_requests.get_nowait()
             request_id = stream.request_id
+            # 请求ID在已完成(终止)的请求集合中
             if request_id in finished_requests:
                 # The request has already been aborted.
+                # 标记请求的异步流已完成并从请求已完成请求集合中移除
                 stream.finish(asyncio.CancelledError)
                 finished_requests.discard(request_id)
-            else:
+            else:   # 请求ID不在已完成请求集合中
                 self._request_streams[request_id] = stream
                 new_requests.append(new_request)
 
         return new_requests, finished_requests
 
     async def wait_for_new_requests(self):
+        """等待新请求"""
+        # 如果当前没有新请求(新请求的异步队列为空)
         if not self.has_new_requests():
+            # 等待新请求到达的事件触发
             await self.new_requests_event.wait()
+        # 当前有新请求,则重置新请求到达的事件
         self.new_requests_event.clear()
 
     def has_new_requests(self):
+        """是否有新请求在异步队列"""
         return not self._new_requests.empty()
 
 
@@ -273,11 +299,12 @@ class _AsyncLLMEngine(LLMEngine):
         """
         # these are cached outputs from previous iterations. None if on first
         # iteration
-        cached_outputs = self.cached_scheduler_outputs[virtual_engine]
+        cached_outputs: SchedulerOutputState = self.cached_scheduler_outputs[virtual_engine]
         seq_group_metadata_list = cached_outputs.seq_group_metadata_list
         scheduler_outputs = cached_outputs.scheduler_outputs
         allow_async_output_proc = cached_outputs.allow_async_output_proc
 
+        # 当前PP-rank的虚拟引擎上下文
         ctx = self.scheduler_contexts[virtual_engine]
 
         # Clear outputs for each new scheduler iteration
@@ -286,9 +313,11 @@ class _AsyncLLMEngine(LLMEngine):
         # skip the scheduler if there are any remaining steps in the seq groups.
         # This ensures that the scheduler is only called again when the current
         # batch has completed.
+        # 如果未启用multi-step或multi-step都执行完成
         if not self._has_remaining_steps(seq_group_metadata_list):
 
             # Schedule iteration
+            # 相应PP-rank虚拟引擎的调度器执行调度
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
              ) = self.scheduler[virtual_engine].schedule()
@@ -297,7 +326,9 @@ class _AsyncLLMEngine(LLMEngine):
             ctx.scheduler_outputs = scheduler_outputs
 
             # Maybe switch from async mode to sync mode
+            # 不使用异步输出处理且有输出结果在当前PP-rank的输出队列
             if not allow_async_output_proc and len(ctx.output_queue) > 0:
+                # 处理一个输出结果(可能包含多个序列分组,处理包括调度器KV-Cache的更新)
                 self._process_model_outputs(ctx=ctx)
 
             if (self.scheduler_config.is_multi_step
@@ -311,7 +342,8 @@ class _AsyncLLMEngine(LLMEngine):
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
 
-        if not scheduler_outputs.is_empty():
+        if not scheduler_outputs.is_empty():    # 调度器的调度输出不为空
+            # 已完成的请求列表
             finished_requests_ids = self.scheduler[
                 virtual_engine].get_and_reset_finished_requests_ids()
 
@@ -336,19 +368,21 @@ class _AsyncLLMEngine(LLMEngine):
                 last_sampled_token_ids=last_sampled_token_ids)
 
             if allow_async_output_proc:
+                # 设置处理当前PP-rank调度器上下文的模型输出为模型的异步回调函数
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
             # Execute the model.
-            outputs = await self.model_executor.execute_model_async(
+            outputs: Optional[List[SamplerOutput]] = await self.model_executor.execute_model_async(
                 execute_model_req)
 
             # we need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
             if self.scheduler_config.is_multi_step:
                 self._update_cached_scheduler_output(virtual_engine, outputs)
-        else:
+        else:   # 调度器的调度输出为空
             if len(ctx.output_queue) > 0:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
             outputs = []
 
@@ -357,12 +391,14 @@ class _AsyncLLMEngine(LLMEngine):
             for seq_group in seq_group_metadata_list:
                 seq_group.finish_step()
 
+        # 如果未启用multi-step或multi-step都执行完成
         if not self._has_remaining_steps(seq_group_metadata_list):
             # Clear the cache if we have finished all the steps
             if self.scheduler_config.is_multi_step:
                 self.cached_scheduler_outputs[
                     virtual_engine] = SchedulerOutputState()
 
+            # 添加模型输出到输出队列
             ctx.append_output(outputs=outputs,
                               seq_group_metadata_list=seq_group_metadata_list,
                               scheduler_outputs=scheduler_outputs,
@@ -373,11 +409,14 @@ class _AsyncLLMEngine(LLMEngine):
                 assert len(
                     outputs
                 ) == 1, "Async postprocessor expects only a single output set"
+                # 为下次迭代提前添加每个序列分组的token-ID和采样的对数概率
                 self._advance_to_next_step(
                     outputs[0], seq_group_metadata_list,
                     scheduler_outputs.scheduled_seq_groups)
 
+            # 不采用异步输出处理
             if not allow_async_output_proc:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
 
                 # Log stats.
@@ -386,13 +425,15 @@ class _AsyncLLMEngine(LLMEngine):
                 # Tracing
                 self.do_tracing(scheduler_outputs)
 
-        else:
+        else:   # 启用multi-step但仍有剩余step未执行
             # Multi-step case
             return ctx.request_outputs
 
+        # 所有PP-rank的调度器中均没有未完成的请求
         if not self.has_unfinished_requests():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
+                # 处理一个输出结果
                 self._process_model_outputs(ctx=ctx)
             assert len(ctx.output_queue) == 0
 
@@ -419,14 +460,17 @@ class _AsyncLLMEngine(LLMEngine):
         if arrival_time is None:
             arrival_time = time.time()
 
-        preprocessed_inputs = await self.input_preprocessor.preprocess_async(
+        # 构建LLMEngine提示词输入
+        preprocessed_inputs: Union[LLMInputs, EncoderDecoderLLMInputs] = await self.input_preprocessor.preprocess_async(
             inputs,
             request_id=request_id,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
+        # 对特定模型进行输入处理
         processed_inputs = self.input_processor(preprocessed_inputs)
 
+        # 添加输入已进行处理的请求到未完成序列数最少的调度器调度器
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -467,29 +511,36 @@ class AsyncLLMEngine:
                  log_requests: bool = True,
                  start_engine_loop: bool = True,
                  **kwargs) -> None:
-        self.log_requests = log_requests
-        self.engine = self._engine_class(*args, **kwargs)
+        self.log_requests: bool = log_requests
+        self.engine: _AsyncLLMEngine = self._engine_class(*args, **kwargs)
 
         # This ensures quick processing of request outputs
         # so the append to asyncio queues is not delayed,
         # especially for multi-step.
-        self.use_process_request_outputs_callback = (
+        self.use_process_request_outputs_callback: bool = (
             self.engine.model_config.use_async_output_proc)
+        """是否使用处理请求输出的回调函数"""
 
         if self.use_process_request_outputs_callback:
+            # 绑定处理请求输出的回调函数
             self.engine.process_request_outputs_callback = \
                 weak_bind(self.process_request_outputs)
 
         self.background_loop: Optional[asyncio.Future] = None
+        """后台引擎循环的异步任务"""
         # We need to keep a reference to unshielded
         # task as well to prevent it from being garbage
         # collected
         self._background_loop_unshielded: Optional[asyncio.Task] = None
-        self.start_engine_loop = start_engine_loop
+        """后台引擎循环的异步任务(不可取消)"""
+        self.start_engine_loop: bool = start_engine_loop
+        """是否自动启动引擎的任务循环"""
         self._errored_with: Optional[BaseException] = None
+        """错误状态信息"""
 
         # Lazy initialized fields
         self._request_tracker: RequestTracker
+        """请求跟踪器"""
 
     def __del__(self):
         if rt := getattr(self, "request_tracker", None):
@@ -499,6 +550,7 @@ class AsyncLLMEngine:
     @classmethod
     def _get_executor_cls(
             cls, engine_config: EngineConfig) -> Type[ExecutorAsyncBase]:
+        """获取模型执行器类"""
         distributed_executor_backend = (
             engine_config.parallel_config.distributed_executor_backend)
         if isinstance(distributed_executor_backend, type):
@@ -570,6 +622,7 @@ class AsyncLLMEngine:
         executor_class = cls._get_executor_cls(engine_config)
 
         if executor_class.uses_ray:
+            # 初始化ray集群
             initialize_ray_cluster(engine_config.parallel_config)
 
         # Create the async LLM engine.
@@ -586,9 +639,10 @@ class AsyncLLMEngine:
 
     @property
     def is_running(self) -> bool:
-        return (self.background_loop is not None
-                and self._background_loop_unshielded is not None
-                and not self._background_loop_unshielded.done())
+        """是否正在运行"""
+        return (self.background_loop is not None    # 后台循环不为空
+                and self._background_loop_unshielded is not None 
+                and not self._background_loop_unshielded.done())    # 后台任务未结束
 
     @property
     def is_stopped(self) -> bool:
@@ -634,8 +688,10 @@ class AsyncLLMEngine:
 
         self._background_loop_unshielded = asyncio.get_event_loop(
         ).create_task(self.run_engine_loop(weakref.ref(self)))
+        # 添加循环结束时的回调函数
         self._background_loop_unshielded.add_done_callback(
             partial(_log_task_completion, error_callback=self._error_callback))
+        # 设置异步任务不可取消
         self.background_loop = asyncio.shield(self._background_loop_unshielded)
 
     def shutdown_background_loop(self) -> None:
@@ -663,6 +719,7 @@ class AsyncLLMEngine:
         for new_request in new_requests:
             # Add the request into the vLLM engine's waiting queue.
             try:
+                # 添加请求到(未完成序列数最少的)调度器
                 await self.engine.add_request_async(**new_request)
             except ValueError as e:
                 # TODO: use a vLLM specific error for failed validation
@@ -675,23 +732,28 @@ class AsyncLLMEngine:
         if aborted_requests:
             await self._engine_abort(aborted_requests)
 
-        request_outputs = await self.engine.step_async(virtual_engine)
+        # 异步Engine-step
+        request_outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = await self.engine.step_async(virtual_engine)
 
         # Put the outputs into the corresponding streams.
         # If used as a callback, then already invoked inside
         # LLMEngine's _process_model_outputs
-        if not self.use_process_request_outputs_callback:
-            all_finished = self.process_request_outputs(request_outputs)
+        if not self.use_process_request_outputs_callback:   # 未使用处理请求输出的回调函数
+            # 处理请求输出添加到异步流
+            all_finished: bool = self.process_request_outputs(request_outputs)
         else:
             # For callback case, we only need to detect when all
             # requests are finished
-            all_finished = all(request_output.finished
+            # 是否所有请求输出都已完成
+            all_finished: bool = all(request_output.finished
                                for request_output in request_outputs)
 
+        # 在本次step处理的请求中是否有仍需要处理的请求
         return not all_finished
 
-    def process_request_outputs(self, request_outputs) -> bool:
+    def process_request_outputs(self, request_outputs: List[Union[RequestOutput, EmbeddingRequestOutput]]) -> bool:
         # Put the outputs into the corresponding streams.
+        # 是否所有的请求均已完成
         all_finished = True
         for request_output in request_outputs:
             self._request_tracker.process_request_output(
@@ -711,10 +773,11 @@ class AsyncLLMEngine:
         if not engine:
             return
 
-        pipeline_parallel_size = \
+        pipeline_parallel_size: int = \
                 engine.engine.parallel_config.pipeline_parallel_size
         has_requests_in_progress = [False] * pipeline_parallel_size
         while True:
+            # 所有PP-rank都没有在处理的请求
             if not any(has_requests_in_progress):
                 logger.debug("Waiting for new requests...")
                 # Stop the execute model loop in parallel workers until there
@@ -724,46 +787,54 @@ class AsyncLLMEngine:
                 # they can process any other queued control plane messages,
                 # such as add/remove lora adapters.
                 await engine.engine.stop_remote_worker_execution_loop_async()
-                request_tracker = engine._request_tracker
+                request_tracker: RequestTracker = engine._request_tracker
                 # Allow engine to be garbage collected while
                 # waiting for new requests
                 del engine
                 await asyncio.sleep(0)
                 if engine_ref() is None:
                     return
+                # 等待新请求到达
                 await request_tracker.wait_for_new_requests()
-                engine = engine_ref()
+                engine: Optional['AsyncLLMEngine'] = engine_ref()
                 if not engine:
                     return
                 logger.debug("Got new requests!")
+                # 每个PP-rank的虚拟引擎对应的Engine-step的异步任务列表
                 requests_in_progress = [
                     asyncio.create_task(engine.engine_step(ve))
                     for ve in range(pipeline_parallel_size)
                 ]
+                # 标记每个PP-rank当前都有请求在执行
                 has_requests_in_progress = [True] * pipeline_parallel_size
 
             # Abort if iteration takes too long due to unrecoverable errors
             # (eg. NCCL timeouts).
             try:
                 async with asyncio_timeout(ENGINE_ITERATION_TIMEOUT_S):
+                    # 等待任一PP-rank的Engine-step任务执行完成
                     done, _ = await asyncio.wait(
                         requests_in_progress,
                         return_when=asyncio.FIRST_COMPLETED)
                     for _ in range(pipeline_parallel_size):
                         await asyncio.sleep(0)
                 for task in done:
-                    result = task.result()
+                    # 当前PP-rank的本次step处理的请求中是否有仍需要处理的请求
+                    result: bool = task.result()
                     virtual_engine = requests_in_progress.index(task)
+                    # 当前PP-rank的虚拟引擎是否有未完成的请求
                     has_unfinished_requests = (
                         engine.engine.
                         has_unfinished_requests_for_virtual_engine(
                             virtual_engine))
+                    # 有未完成的请求
                     if result or has_unfinished_requests:
+                        # 继续进行该PP-rank虚拟引擎的Engine-step执行
                         requests_in_progress[virtual_engine] = (
                             asyncio.create_task(
                                 engine.engine_step(virtual_engine)))
                         has_requests_in_progress[virtual_engine] = True
-                    else:
+                    else:   # PP-rank的虚拟引擎中的请求都已完成
                         has_requests_in_progress[virtual_engine] = False
             except asyncio.TimeoutError as exc:
                 logger.error(
@@ -784,8 +855,10 @@ class AsyncLLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None
     ) -> AsyncGenerator[Union[RequestOutput, EmbeddingRequestOutput], None]:
+        # 引擎还未运行
         if not self.is_running:
             if self.start_engine_loop:
+                # 启动后台引擎循环
                 self.start_background_loop()
             else:
                 raise AsyncEngineDeadError(
@@ -794,7 +867,8 @@ class AsyncLLMEngine:
                     "error that caused the background loop to stop "
                     "(AsyncEngineDeadError).")
 
-        stream = self._request_tracker.add_request(
+        # 添加请求到异步队列
+        stream: AsyncStream = self._request_tracker.add_request(
             request_id,
             verbose=self.log_requests,
             inputs=inputs,
@@ -879,6 +953,7 @@ class AsyncLLMEngine:
             >>> # Process and return the final output
             >>> ...
         """
+        # 添加请求到LLMEngine并等待输出
         async for output in await self.add_request(
                 request_id,
                 inputs,

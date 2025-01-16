@@ -282,6 +282,7 @@ class InputRegistry:
         return wrapper
 
     def _get_model_input_processor(self, model_cls: Type[nn.Module]):
+        """获取特定模型的输入处理器"""
         return self._input_processors_by_model_type \
             .get(model_cls, self._default_input_processor)
 

@@ -37,6 +37,7 @@ class RefCounter(RefCounterProtocol):
         self._refcounts: Dict[BlockId,
                               RefCount] = {index: 0
                                            for index in deduped}
+        """每个分块对应的引用数的字典"""
 
     def incr(self, block_id: BlockId) -> RefCount:
         assert block_id in self._refcounts
@@ -106,17 +107,21 @@ class CopyOnWriteTracker:
 
     def __init__(self, refcounter: RefCounterProtocol):
         self._copy_on_writes: List[Tuple[BlockId, BlockId]] = []
+        """COW操作的(源物理分块ID,目标物理分块ID)元组的列表"""
         self._refcounter = refcounter
+        """KV-Cache物理分块的引用计数"""
 
     def is_appendable(self, block: Block) -> bool:
         """Checks if the block is shared or not. If shared, then it cannot
         be appended and needs to be duplicated via copy-on-write
         """
+        # 没有对应的物理分块ID则可以添加token(共享)
         block_id = block.block_id
         if block_id is None:
             return True
 
         refcount = self._refcounter.get(block_id)
+        # 该分块的物理分块引用计数小于1则可以添加token(共享)
         return refcount <= 1
 
     def record_cow(self, src_block_id: Optional[BlockId],
@@ -165,12 +170,17 @@ class BlockPool:
                  allocator: BlockAllocator, pool_size: int):
         self._block_size = block_size
         self._create_block = create_block
+        """KV-Cache分块的构造器"""
         self._allocator = allocator
         self._pool_size = pool_size
+        """KV-Cache分块池大小 (分块数)"""
         assert self._pool_size >= 0
 
         self._free_ids: Deque[int] = deque(range(self._pool_size))
+        """未使用的KV-Cache逻辑分块索引的双端队列"""
         self._pool = []
+        """KV-Cache逻辑分块池"""
+        # 预分配KV-Cache逻辑分块
         for i in range(self._pool_size):
             self._pool.append(
                 self._create_block(prev_block=None,
@@ -198,10 +208,12 @@ class BlockPool:
 
     def init_block(self, prev_block: Optional[Block], token_ids: List[int],
                    block_size: int, physical_block_id: Optional[int]) -> Block:
+        """初始化逻辑分块并设置物理分块ID"""
         if len(self._free_ids) == 0:
             self.increase_pool()
             assert len(self._free_ids) > 0
 
+        # 逻辑分块ID
         pool_id = self._free_ids.popleft()
 
         block = self._pool[pool_id]
@@ -215,6 +227,7 @@ class BlockPool:
         return block
 
     def free_block(self, block: Block) -> None:
+        """释放逻辑分块,放回分块池中"""
         self._free_ids.appendleft(block.pool_id)  # type: ignore[attr-defined]
 
 
@@ -227,20 +240,25 @@ class BlockList:
 
     def __init__(self, blocks: List[Block]):
         self._blocks: List[Block] = []
+        """逻辑分块列表"""
         self._block_ids: List[int] = []
+        """物理分块的ID列表"""
 
         self.update(blocks)
 
     def _add_block_id(self, block_id: Optional[BlockId]) -> None:
+        """添加分块ID"""
         assert block_id is not None
         self._block_ids.append(block_id)
 
     def _update_block_id(self, block_index: int,
                          new_block_id: Optional[BlockId]) -> None:
+        """更新指定分块的物理分块ID"""
         assert new_block_id is not None
         self._block_ids[block_index] = new_block_id
 
     def update(self, blocks: List[Block]):
+        """更新替换为指定分块列表"""
         self._blocks = blocks
 
         # Cache block ids for fast query
@@ -249,6 +267,7 @@ class BlockList:
             self._add_block_id(block.block_id)
 
     def append_token_ids(self, block_index: int, token_ids: List[int]) -> None:
+        """向指定索引的分块添加token-ID"""
         block = self._blocks[block_index]
         prev_block_id = block.block_id
 
@@ -273,6 +292,7 @@ class BlockList:
         self._update_block_id(block_index, new_block.block_id)
 
     def reset(self):
+        """清空逻辑分块列表和物理分块ID列表"""
         self._blocks = []
         self._block_ids = []
 
@@ -351,6 +371,7 @@ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
     """
 
     def recurse(block: Block, lst: List[Block]) -> None:
+        """递归遍历整个序列的分块表"""
         if block.prev_block is not None:
             recurse(block.prev_block, lst)
         lst.append(block)

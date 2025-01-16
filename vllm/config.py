@@ -158,8 +158,11 @@ class ModelConfig:
         self.model = model
         self.tokenizer = tokenizer
         self.tokenizer_mode = tokenizer_mode
+        """分词器模式"""
         self.trust_remote_code = trust_remote_code
+        """是否信任从远程HF上下载的代码"""
         self.seed = seed
+        """随机数种子"""
         self.revision = revision
         self.code_revision = code_revision
         self.rope_scaling = rope_scaling
@@ -170,24 +173,33 @@ class ModelConfig:
         else:
             self.tokenizer_revision = tokenizer_revision
         self.quantization = quantization
+        """模型权重量化方法"""
         self.quantization_param_path = quantization_param_path
         self.enforce_eager = enforce_eager
+        """是否强制使用eager模式(不使用CUDA-Graph)"""
         if max_context_len_to_capture is not None:
             raise ValueError("`max_context_len_to_capture` is deprecated. "
                              "Use `max_seq_len_to_capture` instead.")
         self.max_seq_len_to_capture = max_seq_len_to_capture
+        """CUDA-Graph可捕获的最大序列长度"""
         self.max_logprobs = max_logprobs
+        """每个输出token返回的对数概率的数目上限"""
         self.disable_sliding_window = disable_sliding_window
+        """是否禁用滑动窗口"""
         self.skip_tokenizer_init = skip_tokenizer_init
+        """是否跳过分词器和逆分词器的初始化"""
 
         self.hf_config = get_config(self.model, trust_remote_code, revision,
                                     code_revision, rope_scaling, rope_theta,
                                     config_format)
+        """HF模型配置"""
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_image_processor_config = get_hf_image_processor_config(
             self.model, revision)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        """模型权重和激活的数据类型"""
         self.use_async_output_proc = use_async_output_proc
+        """是否使用异步输出处理"""
         self.mm_processor_kwargs = mm_processor_kwargs
 
         # Set enforce_eager to False if the value is unset.
@@ -210,8 +222,10 @@ class ModelConfig:
             disable_sliding_window=self.disable_sliding_window,
             sliding_window_len=self.get_hf_config_sliding_window(),
             spec_target_max_model_len=spec_target_max_model_len)
+        """模型支持的最大序列长度"""
         self.served_model_name = get_served_model_name(model,
                                                        served_model_name)
+        """提供服务的模型名称"""
         self.multimodal_config = self._init_multimodal_config(
             limit_mm_per_prompt)
         if not self.skip_tokenizer_init:
@@ -219,6 +233,7 @@ class ModelConfig:
 
         self.override_neuron_config = override_neuron_config if is_neuron(
         ) else None
+        """AWS Neuron配置"""
         self._verify_embedding_mode()
         self._verify_quantization()
         self._verify_cuda_graph()
@@ -227,6 +242,11 @@ class ModelConfig:
     def _init_multimodal_config(
         self, limit_mm_per_prompt: Optional[Mapping[str, int]]
     ) -> Optional["MultiModalConfig"]:
+        """
+        初始化多模态模型配置
+        Args:
+            limit_mm_per_prompt (Optional[Mapping[str, int]]): 多模态情况下每个提示词中输入实例数量上限
+        """
         architectures = getattr(self.hf_config, "architectures", [])
         if any(
                 ModelRegistry.is_multimodal_model(arch)
@@ -249,8 +269,9 @@ class ModelConfig:
 
     def _verify_embedding_mode(self) -> None:
         architectures = getattr(self.hf_config, "architectures", [])
-        self.embedding_mode = any(
+        self.embedding_mode: bool = any(
             ModelRegistry.is_embedding_model(arch) for arch in architectures)
+        """是否是嵌入模型"""
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
@@ -456,6 +477,7 @@ class ModelConfig:
         return self.hf_text_config.hidden_size
 
     def get_head_size(self) -> int:
+        """获取Attention头维度"""
         # TODO remove hard code
         if hasattr(self.hf_text_config, "model_type"
                    ) and self.hf_text_config.model_type == 'deepseek_v2':
@@ -523,21 +545,28 @@ class ModelConfig:
 
     def get_num_attention_heads(self,
                                 parallel_config: "ParallelConfig") -> int:
+        """获取本地Attention头数"""
         num_heads = getattr(self.hf_text_config, "num_attention_heads", 0)
         return num_heads // parallel_config.tensor_parallel_size
 
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
+        """获取本地模型包含的模型层数"""
         from vllm.distributed.utils import get_pp_indices
         total_num_hidden_layers = getattr(self.hf_text_config,
                                           "num_hidden_layers", 0)
         pp_rank = parallel_config.rank // parallel_config.tensor_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
+        # 获取当前pp-rank对应的模型层的起止序号
         start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
         return end - start
 
     def contains_seqlen_agnostic_layers(
             self, parallel_config: "ParallelConfig") -> bool:
-        """True for Mamba/SSM models (Jamba)"""
+        """
+        是否包含与序列长度无关的层
+        
+        True for Mamba/SSM models (Jamba)
+        """
         return self._get_num_seqlen_agnostic_layers(parallel_config) > 0
 
     def get_layers_block_type(self,
@@ -549,6 +578,7 @@ class ModelConfig:
 
     def get_num_attention_layers(self,
                                  parallel_config: "ParallelConfig") -> int:
+        """返回模型中Attention层的数量"""
         return len([
             t for t in self.get_layers_block_type(parallel_config)
             if t == "attention"
@@ -615,20 +645,28 @@ class CacheConfig:
         cpu_offload_gb: float = 0,
     ) -> None:
         self.block_size = block_size
+        """KV-Cache分块大小(包含token数)"""
         self.gpu_memory_utilization = gpu_memory_utilization
+        """GPU利用率:用于模型权重,激活以及KV-Cache的GPU内存比例"""
         self.swap_space_bytes = swap_space * GiB_bytes
         self.num_gpu_blocks_override = num_gpu_blocks_override
+        """用户指定的GPU的KV-Cache分块数"""
         self.cache_dtype = cache_dtype
+        """KV-Cache数据类型"""
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
+        """是否启用prefix-cache"""
         self.cpu_offload_gb = cpu_offload_gb
+        """用于卸载模型权重的CPU内存大小"""
         self._verify_args()
         self._verify_cache_dtype()
         self._verify_prefix_caching()
 
         # Will be set after profiling.
         self.num_gpu_blocks = None
+        """GPU显存的KV-Cache分块数"""
         self.num_cpu_blocks = None
+        """CPU内存的KV-Cache分块数"""
 
     def metrics_info(self):
         # convert cache_config to dict(key: str, value: str) for prometheus
@@ -849,12 +887,15 @@ class ParallelConfig:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.distributed_executor_backend = distributed_executor_backend
+        """用于分布式执行模型的worker后端"""
         self.max_parallel_loading_workers = max_parallel_loading_workers
         self.disable_custom_all_reduce = disable_custom_all_reduce
         self.tokenizer_pool_config = tokenizer_pool_config
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
+        """ray分布式模型worker安置组。"""
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
+        """worker总数 = PP数 * TP数"""
 
         if worker_use_ray:
             if self.distributed_executor_backend is None:
@@ -871,13 +912,16 @@ class ParallelConfig:
                 raise ValueError(
                     "TPU backend only supports Ray for distributed inference.")
 
+        # 未指定worker后端且worker数大于1
         if self.distributed_executor_backend is None and self.world_size > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
 
             from vllm.executor import ray_utils
+            # 默认使用多进程后端
             backend = "mp"
             ray_found = ray_utils.ray_is_available()
+            # CUDA平台且设备数小于总worker数(多结点)时,使用ray后端
             if (current_platform.is_cuda()
                     and cuda_device_count_stateless() < self.world_size):
                 if not ray_found:
@@ -888,6 +932,7 @@ class ParallelConfig:
                 backend = "ray"
             elif ray_found:
                 if self.placement_group:
+                    # 提供了ray的worker组时使用ray后端
                     backend = "ray"
                 else:
                     from ray import is_initialized as ray_is_initialized
@@ -1005,6 +1050,7 @@ class SchedulerConfig:
                 )
 
         self.max_num_batched_tokens = max_num_batched_tokens
+        """单次迭代(一个批次中)的token数目上限"""
 
         if enable_chunked_prefill:
             logger.info(
@@ -1012,16 +1058,24 @@ class SchedulerConfig:
                 self.max_num_batched_tokens)
 
         self.max_num_seqs = max_num_seqs
+        """单次迭代(一个批次中)的序列数目上限"""
         self.max_model_len = max_model_len
+        """模型支持的最大序列长度"""
         self.use_v2_block_manager = use_v2_block_manager
+        """是否使用BlockSpaceManagerV2管理KV-Cache的内存分配"""
         self.num_lookahead_slots = num_lookahead_slots
+        """投机解码时每个序列每个step预分配的token-id槽"""
         self.delay_factor = delay_factor
+        """在调度下一提示词前应用的延迟系数"""
         self.chunked_prefill_enabled = enable_chunked_prefill
+        """是否启用chunked-prefill"""
         self.embedding_mode = embedding_mode
         self.preemption_mode = preemption_mode
         self.num_scheduler_steps = num_scheduler_steps
+        """每次调度执行的步数"""
         self.multi_step_stream_outputs = multi_step_stream_outputs
         self.send_delta_data = send_delta_data
+        """是否发送差值数据"""
         self.policy = policy
         self._verify_args()
 
@@ -1056,11 +1110,13 @@ class SchedulerConfig:
 
     @property
     def is_multi_step(self) -> bool:
+        """是否启用mult-step调度"""
         return self.num_scheduler_steps > 1
 
 
 class DeviceConfig:
     device: Optional[torch.device]
+    """硬件设备类型"""
 
     def __init__(self, device: str = "auto") -> None:
         if device == "auto":
@@ -1807,6 +1863,7 @@ class DecodingConfig:
 
     # Which guided decoding algo to use. 'outlines' / 'lm-format-enforcer'
     guided_decoding_backend: str = 'outlines'
+    """引导解码算法的后端"""
 
     def __post_init__(self):
         valid_guided_backends = ['outlines', 'lm-format-enforcer']
@@ -1825,9 +1882,11 @@ class ObservabilityConfig:
 
     # If set, collects the model forward time for the request.
     collect_model_forward_time: bool = False
+    """是否收集模型前向用时"""
 
     # If set, collects the model execute time for the request.
     collect_model_execute_time: bool = False
+    """是否收集模型执行的总用时(包括准备输入,KV-Cache调整,前向推理,采样等)"""
 
     def __post_init__(self):
         if not is_otel_available() and self.otlp_traces_endpoint is not None:

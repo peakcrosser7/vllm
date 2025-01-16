@@ -876,6 +876,7 @@ class ComputedBlocksTracker:
         self._allocator = allocator
         self._cached_computed_seq_blocks: Dict[int, Tuple[List[int],
                                                           bool]] = {}
+        """已计算的序列分块的缓存字典 (序列ID->())"""
 
     def add_seq(self, seq_id: int) -> None:
         """Start tracking seq_id
@@ -943,7 +944,9 @@ class LastAccessBlocksTracker:
 
     def __init__(self, allocator):
         self._allocator = allocator
+        """KV-Cache分块的CPU和GPU分配器"""
         self._seq_last_access: Dict[int, Optional[float]] = {}
+        """序列上次访问时间戳的字典 (序列ID->时间戳)"""
 
     def add_seq(self, seq_id: int) -> None:
         """Start tracking seq_id
@@ -963,6 +966,7 @@ class LastAccessBlocksTracker:
 
     def update_seq_blocks_last_access(self, seq_id: int,
                                       block_ids: List[int]) -> None:
+        """更新序列的物理分块列表上次访问的时间戳"""
         assert seq_id in self._seq_last_access
 
         ts = self._seq_last_access[seq_id]
@@ -971,6 +975,7 @@ class LastAccessBlocksTracker:
             # No last access was recorded, no need to update.
             return
 
+        # 更新序列物理分块上次访问的时间戳
         self._allocator.mark_blocks_as_accessed(block_ids, ts)
 
 

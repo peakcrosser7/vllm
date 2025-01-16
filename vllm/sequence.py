@@ -16,6 +16,7 @@ import torch
 from vllm.inputs import EncoderDecoderLLMInputs, LLMInputs
 from vllm.inputs.parse import is_valid_encoder_decoder_llm_inputs
 from vllm.lora.request import LoRARequest
+from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
@@ -42,8 +43,11 @@ class Logprob:
         decoded_token: The decoded chosen token index
     """
     logprob: float
+    """所选token的对数概率"""
     rank: Optional[int] = None
+    """所选token的词汇排名"""
     decoded_token: Optional[str] = None
+    """解码后的token文本"""
 
 
 # {token_id -> logprob} per each sequence group. None if the corresponding
@@ -67,6 +71,7 @@ class SequenceStatus(enum.IntEnum):
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
+        """序列是否已完成"""
         return status > SequenceStatus.SWAPPED
 
     @staticmethod
@@ -111,14 +116,22 @@ class RequestMetrics:
                             workers, cpu-gpu sync time and sampling time.
     """
     arrival_time: float
+    """请求到达的时间"""
     last_token_time: float
     first_scheduled_time: Optional[float]
+    """请求第一次被调度的时间"""
     first_token_time: Optional[float]
+    """首个token的生成时间"""
     time_in_queue: Optional[float]
+    """请求在等待队列中的用时"""
     finished_time: Optional[float] = None
+    """请求(序列分组)完成生成的时间"""
     scheduler_time: Optional[float] = None
+    """请求多次调度的总用时"""
     model_forward_time: Optional[float] = None
+    """请求多次模型前向推理的总用时"""
     model_execute_time: Optional[float] = None
+    """请求多次的模型执行总用时(包括模型前向推理,token采样,KV-Cache传输,CPU-GPU同步等)"""
 
 
 class SequenceDataDelta(
@@ -153,35 +166,44 @@ class SequenceData(msgspec.Struct,
     # NOTE: we cannot use Union[List, array] because msgspec cannot support
     # union of 2 list types.
     _prompt_token_ids: array
+    """提示词的token-id数组"""
     _output_token_ids: array = msgspec.field(
         default_factory=lambda: array(VLLM_TOKEN_ID_ARRAY_TYPE, []))
+    """输出token-id数组"""
 
     ### The below fields should not be passed as an argument ###
     _cumulative_logprob: float = 0.0
+    """输出的累计对数概率"""
     _prompt_token_ids_tuple: Tuple[int,
                                    ...] = msgspec.field(default_factory=tuple)
     # The number of tokens that are computed (that run against the model).
     _num_computed_tokens: int = 0
+    """已计算完成的token数"""
     _stage: SequenceStage = SequenceStage.PREFILL
+    """序列所属阶段 (prefill/decode)"""
     _cached_all_token_ids: List[int] = msgspec.field(default_factory=list)
+    """缓存的所有token-ID列表"""
 
     # It is used to get delta input. It is reset when `get_delta_and_reset`
     # is called.
     _new_appended_tokens: List[int] = msgspec.field(default_factory=list)
+    """最新添加的token-ID"""
 
     # It is used to compute mrope_position_ids.
     _mrope_position_delta: Optional[int] = None
 
     @staticmethod
     def from_token_counts(*token_counts: Tuple[int, int]) -> "SequenceData":
+        """构建给定长度和值的SequenceData对象"""
         if len(token_counts) == 0:
             return SequenceData.from_seqs([])
 
-        arrs = [
-            array(VLLM_TOKEN_ID_ARRAY_TYPE, [token_id]) * count
+        arrs: list[array] = [
+            array(VLLM_TOKEN_ID_ARRAY_TYPE, [token_id]) * count # 长度为count的无符号整型数组
             for token_id, count in token_counts
         ]
 
+        # 拼接所有的数组
         return SequenceData(reduce(array.__add__, arrs))
 
     @staticmethod
@@ -202,10 +224,12 @@ class SequenceData(msgspec.Struct,
                             _output_token_ids=output_token_ids_arr)
 
     def __post_init__(self) -> None:
+        # 检查输入输出token-id的类型是否是无符号整型
         assert self._prompt_token_ids.typecode == "l"
         assert self._output_token_ids.typecode == "l"
         self._prompt_token_ids_tuple: Tuple[int, ...] = tuple(
             self._prompt_token_ids)
+        """提示词的token-id元组"""
         self._update_cached_all_tokens()
 
     def _update_cached_all_tokens(self):
@@ -213,9 +237,11 @@ class SequenceData(msgspec.Struct,
         assert isinstance(self._output_token_ids, array)
         self._cached_all_token_ids: List[int] = list(self._prompt_token_ids +
                                                      self._output_token_ids)
+        """缓存的所有(包括提示词和输出的)token-id"""
 
     @property
     def cumulative_logprob(self) -> float:
+        """输出的累计对数概率"""
         return self._cumulative_logprob
 
     @property
@@ -264,21 +290,25 @@ class SequenceData(msgspec.Struct,
         self._mrope_position_delta = new_mrope_position_delta
 
     def append_token_id(self, token_id: int, logprob: float) -> None:
+        """添加token-ID"""
         self._output_token_ids.append(token_id)
         self._new_appended_tokens.append(token_id)
         self._cached_all_token_ids.append(token_id)
         self._cumulative_logprob += logprob
 
     def get_len(self) -> int:
+        """获取序列总长度(输出token数+提示词token数)"""
         return len(self._output_token_ids) + len(self._prompt_token_ids)
 
     def get_prompt_len(self) -> int:
         return len(self._prompt_token_ids)
 
     def get_output_len(self) -> int:
+        """输出token-ID列表的长度"""
         return len(self._output_token_ids)
 
     def get_token_ids(self) -> List[int]:
+        """返回序列的所有token-ID"""
         return self._cached_all_token_ids
 
     def get_prefix_token_ids(
@@ -298,10 +328,12 @@ class SequenceData(msgspec.Struct,
 
     def update_num_computed_tokens(self, num_new_computed_tokens: int):
         """Update number of tokens computed so far."""
+        # 增加已完成计算的token数
         self._num_computed_tokens += num_new_computed_tokens
         assert self._num_computed_tokens <= self.get_len(), (
             self._num_computed_tokens, self.get_len())
         # If all tokens are computed, it means it is in decoding phase.
+        # 如果没有还未计算的prefill的token则设置序列为decode阶段
         if self.get_num_uncomputed_tokens() == 0:
             self._stage = SequenceStage.DECODE
 
@@ -322,6 +354,7 @@ class SequenceData(msgspec.Struct,
         return self.get_len() - self.get_num_computed_tokens()
 
     def get_last_token_id(self) -> int:
+        """获取最后一个token的ID"""
         if not self._output_token_ids:
             return self._prompt_token_ids[-1]
         return self._output_token_ids[-1]
@@ -349,6 +382,7 @@ class SequenceData(msgspec.Struct,
 
     @property
     def stage(self) -> SequenceStage:
+        """序列所属阶段"""
         return self._stage
 
     def __repr__(self) -> str:
@@ -396,9 +430,13 @@ class Sequence:
         from_decoder_prompt: bool = True,
     ) -> None:
         self.seq_id = seq_id
+        """序列ID"""
         self.inputs = inputs
+        """序列输入"""
         self.block_size = block_size
+        """KV-Cache分块大小"""
         self.eos_token_id = eos_token_id
+        """序列终止token-ID"""
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.from_decoder_prompt = from_decoder_prompt
@@ -431,21 +469,29 @@ class Sequence:
                              "encoder input prompt fields?")
 
         self.data = SequenceData.from_seqs(self.prompt_token_ids)
+        """序列数据"""
         self.output_logprobs: SampleLogprobs = []
+        """输出采样的对数概率列表"""
         self.output_text = ""
+        """输出的文本"""
 
         self.status = SequenceStatus.WAITING
+        """序列状态"""
         self.stop_reason: Union[int, str, None] = None
+        """序列停止生成的原因(遇到的停止生成字符串或token)"""
 
         # These are used to keep track of delta outputs
         self._last_output_token_ids_offset: int = 0
+        """上次输出的token-ID偏移"""
         self._last_output_text_offset: int = 0
+        """上次输出的文本偏移"""
 
         # Used for incremental detokenization
         self.prefix_offset = 0
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+        """包含输入和输出的token文本列表"""
 
     @property
     def n_blocks(self) -> int:
@@ -496,10 +542,12 @@ class Sequence:
         this method is returned"""
 
         # We return the full output text if the sequence is finished.
-        truncate = buffer_length and not self.is_finished()
+        truncate: bool = buffer_length and not self.is_finished()
+        # 如果返回完整结果
         if not delta:
             return self.output_text[:-buffer_length] if truncate else (
                 self.output_text)
+        # 如果返回差量
         length = len(self.output_text)
         if truncate:
             length -= buffer_length
@@ -513,9 +561,11 @@ class Sequence:
             self, delta: bool) -> Union[GenericSequence[int], int]:
         """If delta is True, only new tokens since the last call to
         this method are returned"""
+        # 返回完整结果
         if not delta:
             return self.get_output_token_ids()
 
+        # 返回结果差值
         output_len = self.get_output_len()
 
         # Get the number of new tokens
@@ -549,20 +599,24 @@ class Sequence:
 
     def append_token_id(self, token_id: int, logprobs: Dict[int,
                                                             Logprob]) -> None:
+        """添加token-ID及相应的对数概率"""
         assert token_id in logprobs
         self.output_logprobs.append(logprobs)
         self.data.append_token_id(token_id, logprobs[token_id].logprob)
 
     def get_len(self) -> int:
+        """获取序列总长度(输出token数+提示词token数)"""
         return self.data.get_len()
 
     def get_prompt_len(self) -> int:
         return self.data.get_prompt_len()
 
     def get_output_len(self) -> int:
+        """输出token-ID列表的长度"""
         return self.data.get_output_len()
 
     def get_token_ids(self) -> List[int]:
+        """返回序列的所有token-ID"""
         return self.data.get_token_ids()
 
     def get_prompt_token_ids(self) -> Tuple[int, ...]:
@@ -575,6 +629,7 @@ class Sequence:
         return self.data.get_output_token_ids()
 
     def get_cumulative_logprob(self) -> float:
+        """输出的累计对数概率"""
         return self.data.cumulative_logprob
 
     def get_beam_search_score(self,
@@ -597,6 +652,7 @@ class Sequence:
         return self.get_cumulative_logprob() / (seq_len**length_penalty)
 
     def is_finished(self) -> bool:
+        """序列是否已完成"""
         return SequenceStatus.is_finished(self.status)
 
     def fork(self, new_seq_id: int) -> "Sequence":
@@ -616,6 +672,7 @@ class Sequence:
         return self.data.get_num_uncomputed_tokens()
 
     def is_prefill(self) -> bool:
+        """当前序列是否处于prefill阶段"""
         return self.data.stage == SequenceStage.PREFILL
 
     def __repr__(self) -> str:
@@ -630,10 +687,13 @@ class SequenceGroupState(msgspec.Struct,
 
     # for multi-step decoding
     num_steps: int = 1
+    """总step数"""
     current_step: int = 0
+    """当前step数"""
 
     @property
     def remaining_steps(self) -> int:
+        """剩余需执行的step数"""
         return self.num_steps - self.current_step
 
 
@@ -672,10 +732,14 @@ class SequenceGroup:
         priority: int = 0,
     ) -> None:
         self.request_id = request_id
+        """请求ID"""
         self.seqs = seqs
+        """序列的列表"""
         self.arrival_time = arrival_time
         self.is_single_seq = len(seqs) == 1
-        self.seqs_dict = {seq.seq_id: seq for seq in seqs}
+        """是否是单个序列"""
+        self.seqs_dict: Dict[int, Sequence] = {seq.seq_id: seq for seq in seqs}
+        """序列字典 (序列ID->序列)"""
 
         self.sampling_params = sampling_params
         self.metrics = RequestMetrics(arrival_time=arrival_time,
@@ -685,30 +749,38 @@ class SequenceGroup:
                                       time_in_queue=None)
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
+        """提示词token的对数概率列表"""
         self.state = SequenceGroupState()
+        """序列分组状态"""
         self.embeddings = embeddings
         self.pooling_params = pooling_params
         self.prompt_adapter_request = prompt_adapter_request
         self.encoder_seq = encoder_seq
+        """encoder序列"""
         self.trace_headers = trace_headers
         self.priority = priority
+        """用户定义的请求优先级"""
 
-        self.cached_request_output = None
+        self.cached_request_output: Optional[RequestOutput] = None
+        """缓存的请求输出结果"""
 
     @property
     def prompt(self) -> Optional[str]:
+        """提示词文本"""
         # All sequences in the group should have the same prompt.
         # We use the prompt of an arbitrary sequence.
         return self.seqs[0].prompt
 
     @property
     def prompt_token_ids(self) -> List[int]:
+        """提示词的token-ID列表"""
         # All sequences in the group should have the same prompt.
         # We use the prompt of an arbitrary sequence.
         return self.seqs[0].prompt_token_ids
 
     @property
     def encoder_prompt(self) -> Optional[str]:
+        """encoder提示词文本"""
         # There are either 0 or 1 encoder sequences
         # If one is present, its prompt is distinct
         # from the decoder's.
@@ -717,6 +789,7 @@ class SequenceGroup:
 
     @property
     def encoder_prompt_token_ids(self) -> Optional[List[int]]:
+        """encoder提示词的token-ID列表"""
         # There are either 0 or 1 encoder sequences
         # If one is present, its prompt token ids are
         # distinct from the decoder's.
@@ -744,6 +817,7 @@ class SequenceGroup:
                          if self.prompt_adapter_request else 0
 
     def init_multi_step(self, num_scheduler_steps: int) -> None:
+        """初始化multi-step状态"""
         self.state.num_steps = num_scheduler_steps
         self.state.current_step = 0
 
@@ -787,6 +861,7 @@ class SequenceGroup:
         if self.sampling_params and self.sampling_params.use_beam_search:
             # For beam search, maximally there will always be `best_of` beam
             # candidates running in the future.
+            # beam-search每次都会有best_of个候选token,因此一直有best_of个请求在运行
             best_of = self.sampling_params.best_of
             assert isinstance(best_of, int)
             return best_of
@@ -794,20 +869,24 @@ class SequenceGroup:
             if self.sampling_params:
                 best_of = self.sampling_params.best_of
                 assert isinstance(best_of, int)
+                # 序列分组刚从等待状态变为运行状态,其当前的序列数是1,会比best_of小
                 if best_of > self.num_seqs():
                     # At prompt stage, the sequence group is not yet filled up
                     # and only have one sequence running. However, in the
                     # generation stage, we will have `best_of` sequences
                     # running.
+                    # prefill时只会有1个序列在运行,但后续最多是best_of个相同的序列在运行
                     return best_of
             # At sampling stages, return the number of actual sequences
             # that are not finished yet.
+            # decode阶段运行的序列是当前未完成的序列数
             return self.num_unfinished_seqs()
 
     def get_seqs(
         self,
         status: Optional[SequenceStatus] = None,
     ) -> List[Sequence]:
+        """返回序列分组中指定状态的序列列表"""
         if status is None:
             return self.seqs
 
@@ -817,18 +896,22 @@ class SequenceGroup:
         return [seq for seq in self.seqs if seq.status == status]
 
     def is_encoder_decoder(self) -> bool:
+        """是否是encoder-decoder模型的输入序列分组"""
         return self.encoder_seq is not None
 
     def get_encoder_seq(self) -> Optional[Sequence]:
+        """获取encoder序列"""
         return self.encoder_seq
 
     def get_unfinished_seqs(self) -> List[Sequence]:
+        """获取未完成的序列"""
         if self.is_single_seq:
             return self.seqs if not self.seqs[0].is_finished() else []
 
         return [seq for seq in self.seqs if not seq.is_finished()]
 
     def get_finished_seqs(self) -> List[Sequence]:
+        """获取已完成序列的列表"""
         if self.is_single_seq:
             return self.seqs if self.seqs[0].is_finished() else []
 
@@ -838,6 +921,7 @@ class SequenceGroup:
         """Update number of tokens computed so far."""
         for seq in self.seqs:
             if not seq.is_finished():
+                # 更新序列计算的token数及所属阶段
                 seq.data.update_num_computed_tokens(num_new_computed_tokens)
 
     def get_num_uncomputed_tokens(self) -> int:
@@ -848,6 +932,7 @@ class SequenceGroup:
         return num_uncomputed_tokens
 
     def num_seqs(self, status: Optional[SequenceStatus] = None) -> int:
+        """获取指定状态的序列数"""
         # Optimization. We don't need to call get_seqs if we don't need to
         # filter by states.
         if status is None:
@@ -859,6 +944,7 @@ class SequenceGroup:
         return len(self.get_seqs(status))
 
     def num_unfinished_seqs(self) -> int:
+        """未完成的序列数"""
         if self.is_single_seq:
             return 1 if not self.seqs[0].is_finished() else 0
 
@@ -883,19 +969,23 @@ class SequenceGroup:
         self.is_single_seq = len(self.seqs) == 1
 
     def remove(self, seq_id: int) -> None:
-        seq = self.seqs_dict.pop(seq_id, None)
+        """移除指定序列"""
+        seq: Optional[Sequence] = self.seqs_dict.pop(seq_id, None)
         if seq is None:
             raise ValueError(f"Sequence {seq_id} not found.")
+        # 从序列列表中移除该序列
         self.seqs.remove(seq)
         self.is_single_seq = len(self.seqs) == 1
 
     def is_finished(self) -> bool:
+        """是否序列分组中的所有序列均已完成"""
         if self.is_single_seq:
             return self.seqs[0].is_finished()
 
         return all(seq.is_finished() for seq in self.seqs)
 
     def is_prefill(self) -> bool:
+        """当前序列分组是否处于prefill阶段"""
         # Every sequence should be in the same stage.
         return self.seqs[0].is_prefill()
 
@@ -963,23 +1053,34 @@ class SequenceGroupMetadata(
     """
 
     request_id: str
+    """请求ID"""
     is_prompt: bool
+    """是否是带有提示词的序列分组(Prefill请求)"""
     seq_data: Dict[int, SequenceData]
+    """序列数据字典 (请求ID -> 序列数据)"""
     sampling_params: Optional[SamplingParams]
+    """模型采样参数"""
     block_tables: Dict[int, List[int]]
+    """KV-Cache的分块表"""
     do_sample: bool = True
+    """是否对模型输出进行采样"""
     pooling_params: Optional[PoolingParams] = None
     lora_request: Optional[LoRARequest] = None
     computed_block_nums: Optional[List[int]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
         default_factory=lambda: SequenceGroupState())
+    """序列分组状态"""
     # "MultiModalDataDict" types. We have to use Any due to msgspec
     # doesn't allow to have union of 2 different dicts.
     multi_modal_data: Optional[Any] = None
+    """多模态数据"""
     encoder_seq_data: Optional[SequenceData] = None
+    """encoder序列数据"""
     cross_block_table: Optional[List[int]] = None
+    """Cross-Attention的KV-Cache分块表"""
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
     token_chunk_size: Optional[int] = None
+    """将要被计算的token数"""
 
     ### Stateful fields that are lazily defined. ###
     # The number of speculative tokens adopted in this request.
@@ -990,10 +1091,11 @@ class SequenceGroupMetadata(
 
     def __post_init__(self):
         if self.seq_data is not None and self.token_chunk_size is None:
-            if self.is_prompt:
+            if self.is_prompt:  # prefill请求
+                # 下一个序列数据的长度
                 self.token_chunk_size = next(iter(
                     self.seq_data.values())).get_len()
-            else:
+            else:   # decode请求
                 self.token_chunk_size = 1
 
     @property
@@ -1021,8 +1123,10 @@ class SequenceGroupMetadata(
         self.is_prompt = sequence_group_metadata_delta.is_prompt
 
     def finish_step(self) -> None:
+        """记录一次step迭代完成"""
         assert self.state is not None
         assert self.state.current_step < self.state.num_steps
+        # 当前step数自增
         self.state.current_step += 1
 
 
@@ -1040,8 +1144,11 @@ class SequenceOutput(
             (Token id -> logP(x_i+1 | x_0, ..., x_i))
     """
     parent_seq_id: int
+    """父序列ID(用于beam-search)"""
     output_token: int
+    """模型推理采样后的输出token-ID"""
     logprobs: Dict[int, Logprob]
+    """输出token的对数概率"""
 
     def __repr__(self) -> str:
         return (f"SequenceOutput(parent_seq_id={self.parent_seq_id}, "
@@ -1076,8 +1183,10 @@ class CompletionSequenceGroupOutput(
     __metaclass__ = SequenceGroupOutput
     """The model output associated with a completion sequence group."""
     samples: List[SequenceOutput]
+    """采样后的序列输出列表"""
     # Prompt logprob for each prompt query token.
     prompt_logprobs: Optional[PromptLogprobs]
+    """每个query-token的提示词对数概率列表"""
 
     def __repr__(self) -> str:
         return (f"CompletionSequenceGroupOutput(samples={self.samples}, "
@@ -1119,6 +1228,7 @@ class IntermediateTensors(
     """
 
     tensors: Dict[str, torch.Tensor]
+    """张量字典"""
 
     def __getitem__(self, key: Union[str, slice]):
         if isinstance(key, str):
@@ -1280,30 +1390,39 @@ class ExecuteModelRequest(
     # The sequence group metadata list.
     seq_group_metadata_list: List[Union[SequenceGroupMetadata,
                                         SequenceGroupMetadataDelta]]
+    """本轮迭代被调度序列分组的元数据列表"""
     # Blocks to swap in. List of CPU -> GPU block number.
     blocks_to_swap_in: List[Tuple[int,
                                   int]] = msgspec.field(default_factory=list)
+    """需要换入(CPU->GPU)的分块的索引元组(源分块索引,目标分块索引)列表"""
     # Blocks to swap out. List of GPU -> CPU block number.
     blocks_to_swap_out: List[Tuple[int,
                                    int]] = msgspec.field(default_factory=list)
+    """需要换出(GPU->CPU)的分块的索引元组(源分块索引,目标分块索引)列表"""
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]] = msgspec.field(default_factory=list)
+    """需要拷贝的分块的索引元组(源分块索引,目标分块索引)列表"""
     # Virtual engine ID for pipeline parallel.
     virtual_engine: int = 0
+    """PP的虚拟引擎ID"""
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int = 0
+    """每个序列每个step用于投机解码的token-id槽"""
     # The number of requests in the running queue.
     running_queue_size: int = 0
+    """运行队列的大小(请求数/序列分组数)"""
     # Optional hidden states from prior step.
     previous_hidden_states: Optional[HiddenStates] = None
     # The number of forward steps to run.
     num_steps: int = 1
     # Finished request ids since last step.
     finished_requests_ids: List[str] = msgspec.field(default_factory=list)
+    """已完成的请求ID列表"""
     # The last sampled token ids for multi step decoding.
     last_sampled_token_ids: Optional[torch.Tensor] = None
     # Async callback
     async_callback: Optional[Callable] = None
+    """处理模型输出的异步回调函数"""
 
     @property
     def is_first_multi_step(self) -> bool:

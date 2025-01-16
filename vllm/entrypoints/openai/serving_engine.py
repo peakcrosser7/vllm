@@ -83,10 +83,12 @@ class OpenAIServing:
         super().__init__()
 
         self.engine_client = engine_client
+        """LLMEngine客户端"""
         self.model_config = model_config
         self.max_model_len = model_config.max_model_len
 
         self.base_model_paths = base_model_paths
+        """提供服务的模型及其路径"""
 
         self.lora_id_counter = AtomicCounter(0)
         self.lora_requests = []
@@ -181,6 +183,7 @@ class OpenAIServing:
         self,
         request: AnyRequest,
     ) -> Optional[ErrorResponse]:
+        """检查请求使用的模型是否支持"""
         if self._is_model_supported(request.model):
             return None
         if request.model in [lora.lora_name for lora in self.lora_requests]:
@@ -399,8 +402,8 @@ class OpenAIServing:
             prompt = inputs["prompt"]
             prompt_token_ids = inputs["prompt_token_ids"]
 
-        self.request_logger.log_inputs(
             request_id,
+        self.request_logger.log_inputs(
             prompt,
             prompt_token_ids,
             params=params,
@@ -494,4 +497,5 @@ class OpenAIServing:
         return f"Success: LoRA adapter '{lora_name}' removed successfully."
 
     def _is_model_supported(self, model_name):
+        # 模型名称在提供服务的模型中
         return any(model.name == model_name for model in self.base_model_paths)

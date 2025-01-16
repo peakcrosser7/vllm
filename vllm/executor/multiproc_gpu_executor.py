@@ -1,14 +1,14 @@
 import asyncio
 import os
 from functools import partial
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import torch
 
 from vllm.executor.distributed_gpu_executor import (  # yapf: disable
     DistributedGPUExecutor, DistributedGPUExecutorAsync)
 from vllm.executor.gpu_executor import create_worker
-from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
+from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper, ResultFuture,
                                                   ResultHandler, WorkerMonitor)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -69,19 +69,25 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
             "127.0.0.1", get_open_port())
 
         self.workers: List[ProcessWorkerWrapper] = []
+        """worker非主(远端)进程列表"""
+
         # This is the list of workers that are rank 0 of each TP group EXCEPT
         # global rank 0. These are the workers that will broadcast to the
         # rest of the workers.
         self.tp_driver_workers: List[ProcessWorkerWrapper] = []
+        """TP分组的主worker(除global-rank-0的worker)进程列表(发送广播消息)"""
         # This is the list of workers that are not drivers and not the first
         # worker in a TP group. These are the workers that will be
         # broadcasted to.
         self.non_driver_workers: List[ProcessWorkerWrapper] = []
+        """TP分组的其他worker进程列表(接收广播消息)"""
 
         if world_size == 1:
             self.worker_monitor = None
         else:
+            # 结果控制器
             result_handler = ResultHandler()
+            # 启动worker的非主进程 (从rank=1开始)
             for rank in range(1, world_size):
                 worker = ProcessWorkerWrapper(
                     result_handler,
@@ -89,7 +95,7 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
                         create_worker,
                         **self._get_create_worker_kwargs(
                             rank=rank,
-                            local_rank=rank,
+                            local_rank=rank,    # 总rank和本地rank相同
                             distributed_init_method=distributed_init_method,
                         )))
                 self.workers.append(worker)
@@ -99,14 +105,18 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
                     self.non_driver_workers.append(worker)
 
             self.worker_monitor = WorkerMonitor(self.workers, result_handler)
+            """worker监控器,用于监控每个worker进程是否正常运行"""
             result_handler.start()
             self.worker_monitor.start()
 
         # Set up signal handlers to shutdown the executor cleanly
         # sometimes gc does not work well
-
+        # 主worker构建
         self.driver_worker = self._create_worker(
             distributed_init_method=distributed_init_method)
+        """主worker进程 (rank=0)"""
+
+        # 初始化设备环境并加载模型
         self._run_workers("init_device")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
@@ -154,7 +164,7 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         async_run_tensor_parallel_workers_only: bool = False,
         max_concurrent_workers: Optional[int] = None,
         **kwargs,
-    ) -> Any:
+    ) -> List[Union[ResultFuture, Any]]:
         """Runs the given method on all workers.
 
         Args:
@@ -168,6 +178,7 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
             raise NotImplementedError(
                 "max_concurrent_workers is not supported yet.")
 
+        # 仅在远端worker异步执行
         if async_run_tensor_parallel_workers_only:
             # Run only non-driver workers and just return futures.
             return [
@@ -181,10 +192,12 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
             for worker in self.workers
         ]
 
+        # 提取主worker的该方法并执行
         driver_worker_method = getattr(self.driver_worker, method)
         driver_worker_output = driver_worker_method(*args, **kwargs)
 
         # Get the results of the workers.
+        # 此处`get()`方法会等待远端worker执行完成直到从主进程的结果队列拿到结果
         return [driver_worker_output
                 ] + [output.get() for output in worker_outputs]
 
@@ -194,7 +207,7 @@ class MultiprocessingGPUExecutor(DistributedGPUExecutor):
         ):
             raise RuntimeError("Worker processes are not running")
 
-    def _wait_for_tasks_completion(self, parallel_worker_tasks: Any) -> None:
+    def _wait_for_tasks_completion(self, parallel_worker_tasks: List[ResultFuture]) -> None:
         """Wait for futures returned from _run_workers() with
         async_run_remote_workers_only to complete."""
         for result in parallel_worker_tasks:
@@ -207,27 +220,41 @@ class MultiprocessingGPUExecutorAsync(MultiprocessingGPUExecutor,
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.driver_exec_model = make_async(self.driver_worker.execute_model)
+        """主worker执行模型的异步Future函数"""
         self.pp_locks: Optional[List[asyncio.Lock]] = None
+        """流水线并行每个PP-stage的异步锁"""
 
     async def _driver_execute_model_async(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[SamplerOutput]:
+        """在TP主worker上异步执行模型"""
+        # TP主worker(即TP-rank!=0)列表为空
+        # 即此时未启用PP,只有一个global-rank-0的worker是TP-rank=0的worker
         if not self.tp_driver_workers:
+            # 直接由TP主worker执行模型推理
             return await self.driver_exec_model(execute_model_req)
 
+        # 以下为启用了PP执行:
+
+        # 为每个PP-stage创建异步锁
         if self.pp_locks is None:
             # This locks each pipeline parallel stage so multiple virtual
             # engines can't execute on the same stage at the same time
             # We create the locks here to avoid creating them in the constructor
             # which uses a different asyncio loop.
+            # [QTS]为什么不是一个异步事件循环
             self.pp_locks = [
                 asyncio.Lock()
                 for _ in range(self.parallel_config.pipeline_parallel_size)
             ]
 
+        # PP-stage异步任务列表
         tasks = [
             asyncio.create_task(
+                # PP-stage-0的TP主worker(TP-rank=0)执行模型推理
+                # 注:此时PP-stage-0的锁一直被(当前PP-rank的虚拟引擎)所持有,
+                #    直到driver_exec_model执行结束;其他PP-stage同理
                 _run_task_with_lock(self.driver_exec_model, self.pp_locks[0],
                                     execute_model_req))
         ]
@@ -235,17 +262,22 @@ class MultiprocessingGPUExecutorAsync(MultiprocessingGPUExecutor,
                                                 start=1):
             tasks.append(
                 asyncio.create_task(
+                    # 其他PP-stage的TP主worker执行模型推理
                     _run_task_with_lock(driver_worker.execute_method_async,
                                         self.pp_locks[pp_rank],
                                         "execute_model", execute_model_req)))
+        # 等待所有PP-stage的异步任务均完成
         results = await asyncio.gather(*tasks)
 
         # Only the last PP stage has the final results.
         return results[-1]
 
     async def _start_worker_execution_loop(self):
+        """启动非TP主worker的模型执行循环"""
+        # 每非TP主worker执行start_worker_execution_loop方法
         coros = [
             worker.execute_method_async("start_worker_execution_loop")
             for worker in self.non_driver_workers
         ]
+        # 等待执行完成
         return await asyncio.gather(*coros)

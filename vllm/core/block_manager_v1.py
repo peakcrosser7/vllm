@@ -251,11 +251,13 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             # Round up to nearest block size to regularize sliding window
             # allocation sizes.
             self.block_sliding_window = math.ceil(sliding_window / block_size)
+            """滑动窗口大小 (单位:分块数)"""
 
         self.watermark = watermark
         assert watermark >= 0.0
 
         self.enable_caching = enable_caching
+        """是否启用prefix-cache"""
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
 

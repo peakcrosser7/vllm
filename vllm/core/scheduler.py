@@ -52,25 +52,35 @@ class SchedulingBudget:
     feature from the API when chunked prefill is enabled by default.
     """
     token_budget: int
+    """token预算数目总数"""
     max_num_seqs: int
+    """预算支持的序列数目上限"""
     _request_ids_num_batched_tokens: Set[str] = field(default_factory=set)
+    """已使用token预算的请求集合"""
     _request_ids_num_curr_seqs: Set[str] = field(default_factory=set)
+    """已使用token预算的序列的请求集合"""
     _num_batched_tokens: int = 0
+    """本批次的token总数 (已经被使用的token预算数目)"""
     _num_curr_seqs: int = 0
+    """序列总数 (已使用token预算的序列数)"""
 
     def can_schedule(self, *, num_new_tokens: int, num_new_seqs: int):
+        """在包含给定token数和序列数的情况下是否还满足调度预算"""
         assert num_new_tokens != 0
         assert num_new_seqs != 0
         return (self.num_batched_tokens + num_new_tokens <= self.token_budget
                 and self.num_curr_seqs + num_new_seqs <= self.max_num_seqs)
 
     def remaining_token_budget(self):
+        """剩余的token预算数"""
         return self.token_budget - self.num_batched_tokens
 
     def add_num_batched_tokens(self, req_id: str, num_batched_tokens: int):
+        """增加已使用的请求token预算数,跳过已记录过的请求"""
         if req_id in self._request_ids_num_batched_tokens:
             return
 
+        # 记录已使用请求token预算并增加已使用的token预算数目
         self._request_ids_num_batched_tokens.add(req_id)
         self._num_batched_tokens += num_batched_tokens
 
@@ -81,6 +91,7 @@ class SchedulingBudget:
             self._num_batched_tokens -= num_batched_tokens
 
     def add_num_seqs(self, req_id: str, num_curr_seqs: int):
+        """增加已使用token预算的请求序列,跳过已记录过的请求"""
         if req_id in self._request_ids_num_curr_seqs:
             return
 
@@ -94,10 +105,12 @@ class SchedulingBudget:
 
     @property
     def num_batched_tokens(self):
+        """本批次的token总数 (已经被使用的token预算数目)"""
         return self._num_batched_tokens
 
     @property
     def num_curr_seqs(self):
+        """序列总数 (已使用token预算的序列数)"""
         return self._num_curr_seqs
 
 
@@ -105,10 +118,12 @@ class SchedulingBudget:
 class ScheduledSequenceGroup:
     # A sequence group that's scheduled.
     seq_group: SequenceGroup
+    """被调度的序列分组"""
     # The total chunk size (number of tokens) to process for next iteration.
     # 1 for decoding. Same as prompt tokens for prefill, but if prefill is
     # chunked, it can be smaller than that.
     token_chunk_size: int
+    """下次迭代序处理的token数"""
 
 
 @dataclass
@@ -116,23 +131,31 @@ class SchedulerOutputs:
     """The scheduling decision made from a scheduler."""
     # Scheduled sequence groups.
     scheduled_seq_groups: Iterable[ScheduledSequenceGroup]
+    """所有被调度执行的序列分组(按照prefill->decode的顺序)"""
     # Number of prefill groups scheduled.
     num_prefill_groups: int
+    """被调度的prefill序列分组的数目"""
     # Total number of batched tokens.
     num_batched_tokens: int
+    """本调度批次总token数"""
     # Blocks to swap in. List of CPU -> GPU block number.
     blocks_to_swap_in: List[Tuple[int, int]]
     # Blocks to swap out. List of GPU -> CPU block number.
     blocks_to_swap_out: List[Tuple[int, int]]
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]]
+    """需要拷贝的分块的索引元组(源分块索引,目标分块索引)列表"""
     # Sequence groups that are going to be ignored.
     ignored_seq_groups: List[SequenceGroup]
+    """被忽略执行的序列分组"""
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
+    """每个序列每个step用于投机解码的token-id槽"""
     # The number of requests in the running queue
     running_queue_size: int
+    """运行队列的大小(请求数/序列分组数)"""
     preempted: int
+    """被抢占或换出的序列分组数"""
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -145,6 +168,7 @@ class SchedulerOutputs:
         self.num_prompt_adapters: int = len(self.prompt_adapter_requests)
 
     def is_empty(self) -> bool:
+        """是否调度结果为空 (无调度执行的序列分组以及没有需要换入换出/拷贝的KV-Cache分块)"""
         # NOTE: We do not consider the ignored sequence groups.
         return (not self.scheduled_seq_groups and not self.blocks_to_swap_in
                 and not self.blocks_to_swap_out and not self.blocks_to_copy)
@@ -180,23 +204,31 @@ class SchedulerRunningOutputs:
     """
     # Selected sequences that are running and in a decoding phase.
     decode_seq_groups: List[ScheduledSequenceGroup]
+    """需要进行decode计算的序列分组列表"""
     # Selected sequences that are running and in a prefill phase.
     # I.e., it means the prefill has been chunked.
     prefill_seq_groups: List[ScheduledSequenceGroup]
+    """需要进行prefill计算的序列分组列表"""
     # The preempted sequences.
     preempted: List[SequenceGroup]
+    """被抢占的序列分组列表"""
     # Sequences that are swapped out.
     swapped_out: List[SequenceGroup]
+    """被换出的序列分组列表"""
     # The blocks to swap out.
     blocks_to_swap_out: List[Tuple[int, int]]
     # The blocks to copy.
     blocks_to_copy: List[Tuple[int, int]]
+    """需要拷贝的分块的索引元组(源分块索引,目标分块索引)列表 (用于COW操作)"""
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
+    """投机解码时每个序列每个step预分配的token-id槽"""
 
     # Optimization for fast-access to seq_group lists
     decode_seq_groups_list: List[SequenceGroup]
+    """需要进行decode计算的序列分组列表"""
     prefill_seq_groups_list: List[SequenceGroup]
+    """需要进行prefill计算的序列分组列表"""
 
     @classmethod
     def create_empty(cls) -> "SchedulerRunningOutputs":
@@ -231,6 +263,7 @@ class SchedulerSwappedInOutputs:
     blocks_to_copy: List[Tuple[int, int]]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
+    """每个序列每个step用于投机解码的token-id槽"""
     # Infeasible sequence groups.
     infeasible_seq_groups: List[SequenceGroup]
 
@@ -255,9 +288,12 @@ class SchedulerPrefillOutputs:
     """
     # Selected sequences for prefill.
     seq_groups: List[ScheduledSequenceGroup]
+    """被选择执行prefill的序列分组"""
     # Ignored sequence groups.
     ignored_seq_groups: List[SequenceGroup]
+    """被忽略执行的序列分组"""
     num_lookahead_slots: int
+    """每个序列每个step用于投机解码的token-id槽"""
 
     @classmethod
     def create_empty(cls) -> "SchedulerPrefillOutputs":
@@ -335,33 +371,42 @@ class Scheduler:
             num_cpu_blocks=num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching)
+        """KV-Cache分块管理器"""
 
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
         self.waiting: Deque[SequenceGroup] = deque()
+        """等待运行的序列分组的队列"""
         # Sequence groups in the RUNNING state.
         # Contain decode requests.
         self.running: Deque[SequenceGroup] = deque()
+        """运行中的序列分组的队列"""
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
+        """被换出的序列分组的队列"""
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
         # This is used to evict the finished requests from the Mamba cache.
         self._finished_requests_ids: List[str] = list()
+        """在上一step已完成的请求ID列表"""
         # Time at previous scheduling step
         self.prev_time = 0.0
+        """上一次执行prefill-step调度的时间"""
         # Did we schedule a prompt at previous step?
         self.prev_prompt = False
+        """是否在上一step调度了提示词"""
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
+        """上一提示词执行step的时延 (单位:s)"""
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
 
         # The following field is test-only. It is used to inject artificial
         # preemption.
         self.enable_artificial_preemption = ENABLE_ARTIFICIAL_PREEMPT
+        """是否启用人工抢占"""
         self.artificial_preempt_cnt = (ARTIFICIAL_PREEMPTION_MAX_CNT
                                        if self.enable_artificial_preemption
                                        else 0)
@@ -369,18 +414,25 @@ class Scheduler:
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
+        """SequenceGroupMetadata的缓存列表"""
         self._scheduler_running_outputs_cache: List[PyObjectCache] = []
+        """SchedulerRunningOutputs的缓存列表"""
         self._scheduled_seq_group_cache: List[PyObjectCache] = []
+        """ScheduledSequenceGroup的缓存列表"""
 
         # For async output processing, we need to swap cache buffers between
         # iterations. I.e. since the output processing is lagged one step,
         # we cannot reuse the cached objects immediately when the schedule()
         # is called again, but only when schedule() is called the second time.
         self.output_proc_callback = output_proc_callback
+        """输出处理回调函数"""
         self.use_async_output_proc = self.output_proc_callback is not None
+        """是否使用异步输出处理"""
         self.num_cache_iters = 2 if self.use_async_output_proc else 1
+        """缓存ID迭代周期"""
 
         self.cache_id = 0
+        """缓存ID"""
         for i in range(self.num_cache_iters):
             self._seq_group_metadata_cache.append(
                 PyObjectCache(seq_group_metadata_builder))
@@ -394,9 +446,11 @@ class Scheduler:
         # will be stopped during schedule() call and added to this stop list
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
+        """异步后处理时达到最大模型序列长度需停止的序列分组列表"""
 
     @property
-    def next_cache_id(self):
+    def next_cache_id(self) -> int:
+        """下一个缓存ID"""
         return (self.cache_id + 1) % self.num_cache_iters
 
     @property
@@ -409,6 +463,7 @@ class Scheduler:
         return 1
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
+        """添加序列分组到调度器等待队列"""
         # Add sequence groups to the waiting queue.
         self.waiting.append(seq_group)
 
@@ -474,6 +529,8 @@ class Scheduler:
             self.block_manager.free_cross(seq_group)
 
     def has_unfinished_seqs(self) -> bool:
+        """是否有未完成的序列"""
+        # 调度器的队列(等待/运行/交换队列)中有序列
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
             self.swapped) != 0
 
@@ -481,10 +538,12 @@ class Scheduler:
         return self.block_manager.get_prefix_cache_hit_rate(device)
 
     def get_num_unfinished_seq_groups(self) -> int:
+        """获取未完成的序列数目"""
         return len(self.waiting) + len(self.running) + len(self.swapped)
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
+        # 获取已完成请求列表并清空
         finished_requests_ids = self._finished_requests_ids
         self._finished_requests_ids = list()
         return finished_requests_ids
@@ -529,6 +588,7 @@ class Scheduler:
 
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_out: List[Tuple[int, int]] = ret.blocks_to_swap_out
+        # 需要拷贝的分块的索引元组(源分块索引,目标分块索引)列表 (用于COW操作)
         blocks_to_copy: List[Tuple[int, int]] = ret.blocks_to_copy
 
         decode_seq_groups: List[ScheduledSequenceGroup] = ret.decode_seq_groups
@@ -541,6 +601,7 @@ class Scheduler:
         assert len(self._async_stopped) == 0
         while running_queue:
             seq_group = running_queue[0]
+            # 序列分组需要计算的token数
             num_running_tokens = self._get_num_new_tokens(
                 seq_group, SequenceStatus.RUNNING, enable_chunking, budget)
 
@@ -548,12 +609,14 @@ class Scheduler:
                 # No budget => Stop
                 break
 
+            # 将运行队列队首的序列分组移除
             running_queue.popleft()
 
             # With async postprocessor, an extra decode run is done
             # to process the final tokens. The check below avoids this extra
             # decode run when the model max len is reached, in order to avoid
             # a memory overflow.
+            # 将达到模型最大序列长度的请求放入停止列表
             if self.use_async_output_proc and seq_group.seqs[0].get_len(
             ) > self.scheduler_config.max_model_len:
                 self._async_stopped.append(seq_group)
@@ -561,6 +624,7 @@ class Scheduler:
 
             # NOTE(woosuk): Preemption happens only when there is no available
             # slot to keep all the sequence groups in the RUNNING state.
+            # 如果KV-Cache不够给该序列分组分配新分块
             while not self._can_append_slots(seq_group):
                 budget.subtract_num_batched_tokens(seq_group.request_id,
                                                    num_running_tokens)
@@ -610,14 +674,15 @@ class Scheduler:
 
                 if not cont_loop:
                     break
-            else:
+            else:  # 如果KV-Cache足够给该序列分组分配新分块
                 self._append_slots(seq_group, blocks_to_copy)
+                # 在运行中的序列分组可能是chunk-prefill的非首个chunk或者decode请求
                 is_prefill = seq_group.is_prefill()
 
                 scheduled_seq_group: ScheduledSequenceGroup = \
                     self._scheduled_seq_group_cache[self.cache_id].get_object()
                 scheduled_seq_group.seq_group = seq_group
-                if is_prefill:
+                if is_prefill:  # chunk-prefill时
                     scheduled_seq_group.token_chunk_size = num_running_tokens
                     prefill_seq_groups.append(scheduled_seq_group)
                     ret.prefill_seq_groups_list.append(seq_group)
@@ -626,6 +691,7 @@ class Scheduler:
                     decode_seq_groups.append(scheduled_seq_group)
                     ret.decode_seq_groups_list.append(seq_group)
 
+                # 更新token预算
                 budget.add_num_batched_tokens(seq_group.request_id,
                                               num_running_tokens)
                 # OPTIMIZATION:  Note that get_max_num_running_seqs is
@@ -633,7 +699,9 @@ class Scheduler:
                 # enable_chunking is False, num_seqs are updated before running
                 # this method, so we don't have to update it again here.
                 if enable_chunking:
-                    num_running_seqs = seq_group.get_max_num_running_seqs()
+                    # 序列分组中运行的序列数
+                    num_running_seqs: int = seq_group.get_max_num_running_seqs(
+                    )
                     budget.add_num_seqs(seq_group.request_id, num_running_seqs)
                 if curr_loras is not None and seq_group.lora_int_id > 0:
                     curr_loras.add(seq_group.lora_int_id)
@@ -752,9 +820,10 @@ class Scheduler:
         )
 
     def _get_prompt_limit(self, seq_group: SequenceGroup) -> int:
+        """获取提示词的长度上限"""
         if self.scheduler_config.chunked_prefill_enabled:
             prompt_limit = self.scheduler_config.max_model_len
-        else:
+        else:  # 未使用chunked-prefill
             prompt_limit = min(self.scheduler_config.max_model_len,
                                self.scheduler_config.max_num_batched_tokens)
 
@@ -868,42 +937,59 @@ class Scheduler:
         Returns:
             SchedulerPrefillOutputs.
         """
+        # 被忽略计算的序列分组
         ignored_seq_groups: List[SequenceGroup] = []
         seq_groups: List[ScheduledSequenceGroup] = []
 
         waiting_queue = self.waiting
 
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
+        # 从等待队列出队序列分组,直至预算耗尽
+        # 注:_passed_delay()用于让等待队列累计一些请求再处理,
+        #    同时协调运行中队列,避免处理等待队列中的请求过频繁而忽略运行中队列的请求
+        #    或者处理运行中队列中的请求过频繁而忽略等待队列的请求
         while self._passed_delay(time.time()) and waiting_queue:
+            # 考虑调度迭代队列队首的序列分组
             seq_group = waiting_queue[0]
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
             assert len(waiting_seqs) == 1, (
                 "Waiting sequence group should have only one prompt "
                 "sequence.")
+            # 该序列分组需要计算的token数(考虑chunked-prefill)
             num_new_tokens = self._get_num_new_tokens(seq_group,
                                                       SequenceStatus.WAITING,
                                                       enable_chunking, budget)
+            # 不使用chunked-prefill时
             if not enable_chunking:
+                # 需要计算的token数即为提示词token数
                 num_prompt_tokens = waiting_seqs[0].get_len()
                 assert num_new_tokens == num_prompt_tokens
 
+            # 提示词的长度上限
             prompt_limit = self._get_prompt_limit(seq_group)
             if num_new_tokens > prompt_limit:
                 logger.warning(
                     "Input prompt (%d tokens) is too long"
                     " and exceeds limit of %d", num_new_tokens, prompt_limit)
+                # 将该序列分组标记为完成(由于输入提示词过长而忽略计算)
                 for seq in waiting_seqs:
                     seq.status = SequenceStatus.FINISHED_IGNORED
                 ignored_seq_groups.append(seq_group)
+                # 移除当前序列分组
                 waiting_queue.popleft()
                 continue
 
             # If the sequence group cannot be allocated, stop.
-            can_allocate = self.block_manager.can_allocate(seq_group)
+            # 判断是否可以当前序列分组分配KV-Cache分块
+            can_allocate: AllocStatus = self.block_manager.can_allocate(
+                seq_group)
             if can_allocate == AllocStatus.LATER:
+                # 所需的GPU分块较多,暂时跳过该序列分组的调度,稍后再重新调度
+                # 且本次调度也不再考虑后续等待队列中的序列分组
                 break
             elif can_allocate == AllocStatus.NEVER:
+                # 序列过长所需的GPU分块过多,不能分配GPU分块
                 logger.warning(
                     "Input prompt (%d tokens) is too long"
                     " and exceeds the capacity of block_manager",
@@ -913,6 +999,8 @@ class Scheduler:
                 ignored_seq_groups.append(seq_group)
                 waiting_queue.popleft()
                 continue
+
+            # 可以立刻为该序列分组分配KV-Cache分块
 
             lora_int_id = 0
             if self.lora_enabled:
@@ -930,18 +1018,25 @@ class Scheduler:
 
             num_new_seqs = seq_group.get_max_num_running_seqs()
             if (num_new_tokens == 0
+                    # 此处num_new_tokens==0可能的原因:剩余的token预算为0,或因prefix-cache对齐
                     or not budget.can_schedule(num_new_tokens=num_new_tokens,
                                                num_new_seqs=num_new_seqs)):
+                    # 没有新token或超调度预算
+                # 则不再继续调度prefill序列
                 break
 
             # Can schedule this request.
             if curr_loras is not None and lora_int_id > 0:
                 curr_loras.add(lora_int_id)
+            # 从等待队列移除当前序列分组
             waiting_queue.popleft()
+            # 为序列分组分配KV-Cache分块表且设置序列分组为运行中状态
             self._allocate_and_set_running(seq_group)
+            # prefill阶段multi-step数为1
             seq_group.init_multi_step(
                 num_scheduler_steps=self._get_num_lookahead_slots(
                     is_prefill=True) + 1)
+            # 增加调度序列分组已经更新预算
             seq_groups.append(
                 ScheduledSequenceGroup(seq_group=seq_group,
                                        token_chunk_size=num_new_tokens))
@@ -950,6 +1045,7 @@ class Scheduler:
 
         # Queue requests that couldn't be scheduled.
         waiting_queue.extendleft(leftover_waiting_sequences)
+        # 调度的序列中分组有prefill阶段的
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
@@ -1008,8 +1104,8 @@ class Scheduler:
                     running_scheduled.swapped_out) == 0:
                 swapped_in = self._schedule_swapped(budget, curr_loras)
 
-        assert (budget.num_batched_tokens <=
-                self.scheduler_config.max_num_batched_tokens)
+        assert (budget.num_batched_tokens
+                <= self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
@@ -1086,32 +1182,37 @@ class Scheduler:
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
         # Decoding should be always scheduled first by fcfs.
-        running_scheduled = self._schedule_running(budget,
-                                                   curr_loras,
-                                                   enable_chunking=True)
+        # 调度已运行的(decode或后续chunked-prefill)序列分组
+        running_scheduled: SchedulerRunningOutputs = self._schedule_running(
+            budget, curr_loras, enable_chunking=True)
 
         # Schedule swapped out requests.
         # If preemption happens, it means we don't have space for swap-in.
+        # 没有被强占和被换出的序列分组时才调度序列分组换入
         if len(running_scheduled.preempted) + len(
                 running_scheduled.swapped_out) == 0:
-            swapped_in = self._schedule_swapped(budget, curr_loras)
+            swapped_in: SchedulerSwappedInOutputs = self._schedule_swapped(
+                budget, curr_loras)
 
         # Schedule new prefills.
-        prefills = self._schedule_prefills(budget,
-                                           curr_loras,
-                                           enable_chunking=True)
+        # 调度新的prefill请求
+        prefills: SchedulerPrefillOutputs = self._schedule_prefills(
+            budget, curr_loras, enable_chunking=True)
 
-        assert (budget.num_batched_tokens <=
-                self.scheduler_config.max_num_batched_tokens)
+        assert (budget.num_batched_tokens
+                <= self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
         # Update waiting requests.
+        # 将被抢占的序列分组添加到等待队列队首,以便下次调度
         self.waiting.extendleft(running_scheduled.preempted)
 
         # Update new running requests.
         # By default, vLLM scheduler prioritizes prefills.
         # Once chunked prefill is enabled,
         # the policy is changed to prioritize decode requests.
+        # 将所有被调度的序列分组全部加入到运行中队列中
+        # 调度优先级: 换入decode > 换入prefill > decode > chunked-prefill > 新prefill
         self.running.extend(
             [s.seq_group for s in swapped_in.decode_seq_groups])
         self.running.extend(
@@ -1173,6 +1274,8 @@ class Scheduler:
         )
 
     def _allow_async_output_proc(self, seq_group: SequenceGroup) -> bool:
+        """检查是否可以异步输出处理"""
+        # 不进行输出采样或输出序列数为1且不使用beam-search
         no_beam_search = seq_group.sampling_params is None or (
             seq_group.sampling_params.best_of == 1
             and not seq_group.sampling_params.use_beam_search)
@@ -1181,12 +1284,24 @@ class Scheduler:
     def schedule(
             self
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+        """执行调度器调度
+
+        Returns:
+            
+            Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]: 
+
+                seq_group_metadata_list (List[SequenceGroupMetadata]): 被调度序列分组的元数据列表
+                scheduler_outputs (SchedulerOutputs): 调度器的调度输出
+                allow_async_output_proc (bool): 是否可以异步处理模型输出
+
+        """
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
-        scheduler_outputs = self._schedule()
+        # 调度序列分组
+        scheduler_outputs: SchedulerOutputs = self._schedule()
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1196,13 +1311,16 @@ class Scheduler:
 
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
+        # 遍历需要调度执行的序列分组
         for i, scheduled_seq_group in enumerate(
                 scheduler_outputs.scheduled_seq_groups):
             seq_group = scheduled_seq_group.seq_group
+            # 该序列待计算的token数
             token_chunk_size = scheduled_seq_group.token_chunk_size
+            # 记录请求首次被调度的时间和等待时间
             seq_group.maybe_set_first_scheduled_time(now)
 
-            seq_group_metadata = self._seq_group_metadata_cache[
+            seq_group_metadata: SequenceGroupMetadata = self._seq_group_metadata_cache[
                 self.cache_id].get_object()
             seq_group_metadata.seq_data.clear()
             seq_group_metadata.block_tables.clear()
@@ -1214,13 +1332,13 @@ class Scheduler:
 
             if seq_group.is_encoder_decoder():
                 # Encoder associated with SequenceGroup
-                encoder_seq = seq_group.get_encoder_seq()
+                encoder_seq: Sequence = seq_group.get_encoder_seq()
                 assert encoder_seq is not None
                 encoder_seq_data = encoder_seq.data
                 # Block table for cross-attention
                 # Also managed at SequenceGroup level
-                cross_block_table = self.block_manager.get_cross_block_table(
-                    seq_group)
+                cross_block_table: List[
+                    int] = self.block_manager.get_cross_block_table(seq_group)
             else:
                 encoder_seq_data = None
                 cross_block_table = None
@@ -1229,6 +1347,7 @@ class Scheduler:
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                # 启用prefix-cache时
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
             if self.cache_config.enable_prefix_caching:
@@ -1245,19 +1364,24 @@ class Scheduler:
                 seqs = seq_group.get_seqs()
                 # Prefill has only 1 sequence.
                 assert len(seqs) == 1
+                # 序列已计算的token数
                 num_computed_tokens = seqs[0].data.get_num_computed_tokens()
+                # 若已计算的token数为0,则为首次执行prefill
                 is_first_prefill = num_computed_tokens == 0
                 # In the next iteration, all prompt tokens are not computed.
                 # It means the prefill is chunked, and we don't need sampling.
                 # NOTE: We use get_len instead of get_prompt_len because when
                 # a sequence is preempted, prefill includes previous generated
                 # output tokens.
-                if (token_chunk_size + num_computed_tokens <
-                        seqs[0].data.get_len()):
+                # 将要计算的token数+已计算的token数 < 序列token总数
+                # 则为chunked-prefill阶段的非最后的prefill-chunk,不进行采样
+                if (token_chunk_size + num_computed_tokens
+                        < seqs[0].data.get_len()):
                     do_sample = False
 
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
+            # 默认在首次prefill时发送完整元数据
             if is_first_prefill or not self.scheduler_config.send_delta_data:
                 seq_group_metadata = SequenceGroupMetadata(
                     request_id=seq_group.request_id,
@@ -1298,7 +1422,7 @@ class Scheduler:
                 )
             seq_group_metadata_list.append(seq_group_metadata)
 
-            if allow_async_output_proc:
+            if allow_async_output_proc:  # 使用异步输出处理
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
 
@@ -1317,6 +1441,7 @@ class Scheduler:
         # Add this to scheduler time to all the sequences that are currently
         # running. This will help estimate if the scheduler is a significant
         # component in the e2e latency.
+        # 记录序列分组的调度用时
         for seq_group in self.running:
             if seq_group is not None and seq_group.metrics is not None:
                 if seq_group.metrics.scheduler_time is not None:
@@ -1332,6 +1457,7 @@ class Scheduler:
                 allow_async_output_proc)
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
+        """复刻父序列的KV-Cache分块表到子序列"""
         self.block_manager.fork(parent_seq, child_seq)
 
     def free_seq(self, seq: Sequence) -> None:
@@ -1342,9 +1468,11 @@ class Scheduler:
         """Free finished seqs in a sequence group."""
         for seq in seq_group.get_seqs():
             if seq.is_finished():
+                # 清除序列的KV-Cache分块表
                 self.free_seq(seq)
 
     def _free_finished_seq_group(self, seq_group: SequenceGroup) -> None:
+        """释放序列分组中已完成序列的KV-Cache分块表"""
         if seq_group.is_finished():
             # Free cross-attention block table, if it exists
             self._free_seq_group_cross_attn_blocks(seq_group)
@@ -1355,20 +1483,26 @@ class Scheduler:
             self._finished_requests_ids.append(seq_group.request_id)
 
         # Free finished seqs
+        # 清除序列分组的KV-Cache分块表
         self._free_finished_seqs(seq_group)
 
     def free_finished_seq_groups(self) -> None:
+        """释放运行中序列分组队列中已完成序列的KV-Cache分块表并更新运行中的序列分组队列"""
         remaining: Deque[SequenceGroup] = deque()
         for seq_group in self.running:
+            # 释放序列分组中已完成序列的KV-Cache分块表
             self._free_finished_seq_group(seq_group)
+            # 如果序列分组未完成则添加到剩余队列中
             if not seq_group.is_finished():
                 remaining.append(seq_group)
 
+        # 更新运行中的请求队列
         self.running = remaining
 
         # Handle async stopped sequence groups
         # (ones that reached max model len)
         if self._async_stopped:
+            # 异步后处理时达到最大模型序列长度需停止的序列分组
             for seq_group in self._async_stopped:
                 self._free_seq_group_cross_attn_blocks(seq_group)
                 self._finished_requests_ids.append(seq_group.request_id)
@@ -1379,7 +1513,10 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+        """为序列分组分配KV-Cache分块表并设置状态为运行中"""
+        # 为序列分组分配KV-Cache分块表
         self.block_manager.allocate(seq_group)
+        # 将序列分组中的序列状态由等待变为运行中
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
 
@@ -1404,6 +1541,7 @@ class Scheduler:
 
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             cows = self.block_manager.append_slots(seq, num_lookahead_slots)
+            # 记录所有COW操作
             if len(cows) > 0:
                 blocks_to_copy.extend(cows)
 
@@ -1498,18 +1636,24 @@ class Scheduler:
             seq.status = SequenceStatus.SWAPPED
 
     def _passed_delay(self, now: float) -> bool:
+        """是否跳过延迟等待"""
         if self.prev_prompt:
+            # 上一提示词执行step的时延
             self.last_prompt_latency = now - self.prev_time
         self.prev_time, self.prev_prompt = now, False
         # Delay scheduling prompts to let waiting queue fill up
+        # 调度提示词请求的延迟系数大于0且等待队列有请求
         if self.scheduler_config.delay_factor > 0 and self.waiting:
+            # 等待队列中最早到达的请求的到达时间
             earliest_arrival_time = min(
                 [e.metrics.arrival_time for e in self.waiting])
             passed_delay = (
-                (now - earliest_arrival_time) >
-                (self.scheduler_config.delay_factor * self.last_prompt_latency)
-                or not self.running)
-        else:
+                # 从最早到达请求到达时间到此刻的时长 > 延迟系数*距离上次调度的时长
+                (now - earliest_arrival_time
+                 ) > (self.scheduler_config.delay_factor *
+                      self.last_prompt_latency)
+                or not self.running)  # 或没有运行中的序列分组
+        else:  # 调度提示词请求的延迟系数等于0或等待队列没有请求
             passed_delay = True
         return passed_delay
 
@@ -1539,14 +1683,18 @@ class Scheduler:
 
         Returns 0 if the new token cannot be computed due to token budget.
         """
+        # 序列分组本次迭代需计算的token总数
         num_new_tokens = 0
+        # 当前序列分组指定状态的序列
         seqs = seq_group.get_seqs(status=status)
+        # 计算每个序列本次迭代需计算的token数
         for seq in seqs:
             num_new_tokens += seq.get_num_new_tokens()
         assert num_new_tokens > 0
         # Chunk if a running request cannot fit in the given budget.
         # If number of seq > 1, it means it is doing beam search
         # in a decode phase. Do not chunk.
+        # 启用chunked-prefill且在prefill阶段或不使用beam-search的decode阶段
         if enable_chunking and len(seqs) == 1:
             remaining_token_budget = budget.remaining_token_budget()
             if self.cache_config.enable_prefix_caching:
@@ -1562,9 +1710,13 @@ class Scheduler:
                                      "block size, but got chunk_size "
                                      f"({budget.token_budget}) % block_size "
                                      f"({block_size}) = {remainder}")
+                # 剩余token预算不够所有token计算
                 if remaining_token_budget < num_new_tokens:
+                    # 计算的token数与KV-Cache分块大小对齐
                     num_new_tokens = (remaining_token_budget //
                                       block_size) * block_size
-            else:
+            else:  # 不使用prefix-cache时无需考虑V-Cache分块大小对齐
                 num_new_tokens = min(num_new_tokens, remaining_token_budget)
+        # 其他情况: 不使用chunked-prefill,chunked-prefill且使用beam-search的decode阶段
+        # 直接返回序列分组中本次迭代需要计算的token数
         return num_new_tokens

@@ -81,6 +81,7 @@ class SamplerOutput(
     """
 
     outputs: List[CompletionSequenceGroupOutput]
+    """补全序列分组输出列表"""
 
     # On-device tensor containing probabilities of each token.
     sampled_token_probs: Optional[torch.Tensor] = None
@@ -105,22 +106,26 @@ class SamplerOutput(
 
     # Optional last hidden states from the model.
     hidden_states: Optional[torch.Tensor] = None
+    """模型推理得到的hidden-states(包括prefill和decode,仅包含生成logits的token)"""
 
     # Optional prefill hidden states from the model
     # (used for models like EAGLE).
     prefill_hidden_states: Optional[torch.Tensor] = None
+    """prefill阶段模型推理得到的hidden-states"""
 
     # Time taken in the forward pass for this across all workers
     model_forward_time: Optional[float] = None
+    """模型前向推理用时"""
 
     # Time taken in the model execute function. This will include model forward,
     # block/sync across workers, cpu-gpu sync time and sampling time.
     model_execute_time: Optional[float] = None
+    """模型执行用时(包括模型前向推理,token采样,KV-Cache传输,CPU-GPU同步等)"""
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> CompletionSequenceGroupOutput:
         return self.outputs[idx]
 
-    def __setitem__(self, idx: int, value):
+    def __setitem__(self, idx: int, value: CompletionSequenceGroupOutput):
         self.outputs[idx] = value
 
     def __len__(self):
@@ -227,7 +232,9 @@ class Sampler(nn.Module):
         _, vocab_size = logits.shape
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
+        # 不重用采样张量
         if not sampling_metadata.reuse_sampling_tensors:
+            # 初始化采样张量
             self._init_sampling_tensors(logits, sampling_metadata)
         elif self._do_penalties:
             # In this case, the sampling tensors logic depends on

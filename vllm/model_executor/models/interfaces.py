@@ -94,6 +94,9 @@ class _SupportsLoRAType(Protocol):
         ...
 
 
+# 以下两个重载函数用于指示静态类型检查
+# 使得静态类型检查器根据类型推断出更具体的返回类型,运行时忽略
+
 @overload
 def supports_lora(model: Type[object]) -> TypeIs[Type[SupportsLoRA]]:
     ...
@@ -185,6 +188,7 @@ def has_inner_state(model: Type[object]) -> TypeIs[Type[HasInnerState]]:
 def has_inner_state(
     model: Union[Type[object], object]
 ) -> Union[TypeIs[Type[HasInnerState]], TypeIs[HasInnerState]]:
+    """模型是否有内部状态,即需要访问调度配置等信息"""
     if isinstance(model, type):
         return isinstance(model, _HasInnerStateType)
 

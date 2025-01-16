@@ -157,9 +157,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
     model: str
+    """模型名称"""
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[bool] = False
+    """是否响应输出token的对数概率"""
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = None
     n: Optional[int] = 1
@@ -168,7 +170,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
+    """是否启用流式响应"""
     stream_options: Optional[StreamOptions] = None
+    """流式响应的选项"""
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     tools: Optional[List[ChatCompletionToolsParam]] = None
@@ -211,6 +215,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "This is a parameter used by chat template in tokenizer config of the "
          "model."),
     )
+    """是否将生成的提示词加入到对换模板"""
     add_special_tokens: bool = Field(
         default=False,
         description=(

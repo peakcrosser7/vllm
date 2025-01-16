@@ -46,13 +46,18 @@ class BlockTable:
         max_block_sliding_window: Optional[int] = None,
     ):
         self._block_size = block_size
+        """KV-Cache分块大小"""
         self._allocator = block_allocator
+        """分块分配器"""
         if _blocks is None:
             _blocks = []
         self._blocks: BlockList = BlockList(_blocks)
+        """KV-Cache分块列表(对应一个序列中的连续token)"""
 
         self._max_block_sliding_window = max_block_sliding_window
         self._num_full_slots = self._get_num_token_ids()
+        """已占用的token槽数(存储在分块表中的token数)"""
+
 
     @staticmethod
     def get_num_required_blocks(token_ids: List[int], block_size: int) -> int:
@@ -88,9 +93,11 @@ class BlockTable:
         """
         assert not self._is_allocated
         assert token_ids
+        # 为token-IDs分配KV-Cache分块
         blocks = self._allocate_blocks_for_token_ids(prev_block=None,
                                                      token_ids=token_ids,
                                                      device=device)
+        # 用当前分块更替当前分块表
         self.update(blocks)
         self._num_full_slots = len(token_ids)
 
@@ -133,26 +140,31 @@ class BlockTable:
         if self._max_block_sliding_window is not None:
             null_block = self._allocator.allocate_or_get_null_block()
             assert num_computed_slots is not None
+            # 滑动窗口的左边界
             end_block_idx = (num_computed_slots //
                              self._block_size) - self._max_block_sliding_window
+            # 释放左边界以外的分块并设置为空分块
             for idx in range(0, end_block_idx):
-                b = self._blocks[idx]
+                b: Block = self._blocks[idx]
                 if b is not null_block:
                     self._allocator.free(b)
                     self._blocks[idx] = null_block
 
         # Ensure there are enough empty slots for the new tokens plus
         # lookahead slots
+        # 确保分块表中有足够的空token槽,必要时分配KV-Cache分块
         self.ensure_num_empty_slots(num_empty_slots=len(token_ids) +
                                     num_lookahead_slots)
 
         # Update the blocks with the new tokens
         first_block_idx = self._num_full_slots // self._block_size
-        token_blocks = self._chunk_token_blocks_for_append(token_ids)
+        token_blocks: List[List[int]] = self._chunk_token_blocks_for_append(token_ids)
 
         for i, token_block in enumerate(token_blocks):
             self._blocks.append_token_ids(first_block_idx + i, token_block)
 
+        # 更新已占用的token槽数
+        # 注:num_lookahead_slots不占用token槽
         self._num_full_slots += len(token_ids)
 
     def ensure_num_empty_slots(self, num_empty_slots: int) -> None:
@@ -175,9 +187,11 @@ class BlockTable:
         if self._num_empty_slots >= num_empty_slots:
             return
 
+        # 可用token槽小于所需槽数则进行分配
         slots_to_allocate = num_empty_slots - self._num_empty_slots
         blocks_to_allocate = cdiv(slots_to_allocate, self._block_size)
 
+        # 分配所需的KV-Cache(逻辑+物理)分块
         for _ in range(blocks_to_allocate):
             assert len(self._blocks) > 0
             self._blocks.append(
@@ -199,6 +213,7 @@ class BlockTable:
         """
         assert self._is_allocated
         assert len(self._blocks) > 0
+        # 指向相同物理分块的逻辑分块列表
         forked_blocks = self._allocator.fork(self._blocks[-1])
         return BlockTable(
             block_size=self._block_size,
@@ -216,6 +231,7 @@ class BlockTable:
         is set to `None`.
         """
         assert self._is_allocated
+        # 遍历每个分块进行释放
         for block in self.blocks:
             self._allocator.free(block)
         self._blocks.reset()
@@ -259,10 +275,11 @@ class BlockTable:
     def _allocate_blocks_for_token_ids(self, prev_block: Optional[Block],
                                        token_ids: List[int],
                                        device: Device) -> List[Block]:
+        """为token-IDs分配KV-Cache分块"""
         blocks: List[Block] = []
 
-        block_token_ids = []
-        tail_token_ids = []
+        block_token_ids = []    # 填充满的token分块
+        tail_token_ids = []     # 尾部未填充满的token分块
         for cur_token_ids in chunk_list(token_ids, self._block_size):
             if len(cur_token_ids) == self._block_size:
                 block_token_ids.append(cur_token_ids)
@@ -270,16 +287,20 @@ class BlockTable:
                 tail_token_ids.append(cur_token_ids)
 
         if block_token_ids:
+            # 对于已填满的token分块
             blocks.extend(
+                # 创建不可更改的KV-Cache分块(即已经添加token-IDs的分块)
                 self._allocator.allocate_immutable_blocks(
                     prev_block, block_token_ids=block_token_ids,
                     device=device))
             prev_block = blocks[-1]
 
         if tail_token_ids:
+            # 对于尾部未填满的token分块
             assert len(tail_token_ids) == 1
             cur_token_ids = tail_token_ids[0]
 
+            # 创建可更改的KV-Cache分块并添加token-IDs
             block = self._allocator.allocate_mutable_block(
                 prev_block=prev_block, device=device)
             block.append_token_ids(cur_token_ids)
@@ -301,6 +322,7 @@ class BlockTable:
         return token_ids
 
     def _get_num_token_ids(self) -> int:
+        """获取当前分块表中的token-ID总数"""
         res = 0
         for block in self.blocks:
             res += len(block.token_ids)
@@ -309,14 +331,17 @@ class BlockTable:
 
     @property
     def _is_allocated(self) -> bool:
+        """是否分配了分块"""
         return len(self._blocks) > 0
 
     @property
     def blocks(self) -> List[Block]:
+        """KV-Cache分块列表"""
         return self._blocks.list()
 
     @property
     def _num_empty_slots(self) -> int:
+        """空余可用的token槽数"""
         assert self._is_allocated
         return len(self._blocks) * self._block_size - self._num_full_slots
 
@@ -343,9 +368,12 @@ class BlockTable:
         # token_blocks = self._chunk_token_blocks_for_append(all_token_ids)
         # return len(token_blocks)
 
+        # 需要添加的token总数
         num_token_ids = len(token_ids) + num_lookahead_slots
+        # 第一个分块的大小,分块可能已存了一些token
         first_chunk_size = self._block_size - (self._num_full_slots %
                                                self._block_size)
+        # 1表示的是第一个分块
         num_token_blocks = (1 + math.ceil(
             (num_token_ids - first_chunk_size) / self._block_size))
         return num_token_blocks
@@ -363,9 +391,11 @@ class BlockTable:
         if not token_ids:
             return []
 
+        # 第一个分块的可用token槽数
         first_chunk_size = self._block_size - (self._num_full_slots %
                                                self._block_size)
-        token_blocks = [token_ids[:first_chunk_size]]
+        token_blocks: List[List[int]] = [token_ids[:first_chunk_size]]
         token_blocks.extend(
+            # 按照分块大小对token_ids进行切块
             chunk_list(token_ids[first_chunk_size:], self._block_size))
         return token_blocks

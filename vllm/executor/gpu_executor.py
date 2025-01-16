@@ -16,6 +16,7 @@ logger = init_logger(__name__)
 def create_worker(worker_module_name: str, worker_class_name: str,
                   worker_class_fn: Optional[Callable[[], Type[WorkerBase]]],
                   **kwargs):
+    """构造worker对象"""
     wrapper = WorkerWrapperBase(
         worker_module_name=worker_module_name,
         worker_class_name=worker_class_name,
@@ -62,12 +63,13 @@ class GPUExecutor(ExecutorBase):
             speculative_config=self.speculative_config,
             prompt_adapter_config=self.prompt_adapter_config,
             is_driver_worker=(not self.parallel_config)
-            or (rank % self.parallel_config.tensor_parallel_size == 0),
+                             or (rank % self.parallel_config.tensor_parallel_size == 0),
             observability_config=self.observability_config,
         )
 
     def _get_worker_module_and_class(
             self) -> Tuple[str, str, Optional[Callable[[], Type[WorkerBase]]]]:
+        """根据配置获取相应worker的模块名和类名"""
         worker_class_fn = None
         if self.scheduler_config.is_multi_step:
             worker_module_name = "vllm.worker.multi_step_worker"
@@ -85,7 +87,8 @@ class GPUExecutor(ExecutorBase):
             local_rank: int = 0,
             rank: int = 0,
             distributed_init_method: Optional[str] = None) -> Dict:
-        worker_kwargs = self._get_worker_kwargs(local_rank, rank,
+        """获取构建worker所需的参数"""
+        worker_kwargs: Dict[str, Any] = self._get_worker_kwargs(local_rank, rank,
                                                 distributed_init_method)
 
         (worker_module_name, worker_class_name,

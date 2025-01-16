@@ -48,10 +48,12 @@ class ResultFuture(threading.Event, Generic[T]):
         self.result: Optional[Result[T]] = None
 
     def set_result(self, result: Result[T]):
+        """设置结果"""
         self.result = result
         self.set()
 
     def get(self) -> T:
+        # 等待结果
         self.wait()
         assert self.result is not None
         if self.result.exception is not None:
@@ -61,14 +63,18 @@ class ResultFuture(threading.Event, Generic[T]):
 
 def _set_future_result(future: Union[ResultFuture, asyncio.Future],
                        result: Result):
+    """设置Future的执行结果"""
     if isinstance(future, ResultFuture):
         future.set_result(result)
         return
+    
+    # isinstance(future, asyncio.Future)
     loop = future.get_loop()
     if not loop.is_closed():
-        if result.exception is not None:
+        if result.exception is not None:    # 有异常
+            # 以线程安全的方式请求事件循环执行目标函数
             loop.call_soon_threadsafe(future.set_exception, result.exception)
-        else:
+        else:   # 没有异常
             loop.call_soon_threadsafe(future.set_result, result.value)
 
 
@@ -79,10 +85,14 @@ class ResultHandler(threading.Thread):
         super().__init__(daemon=True)
         self.result_queue = mp.Queue()
         self.tasks: Dict[uuid.UUID, Union[ResultFuture, asyncio.Future]] = {}
+        """结果Future队列"""
 
     def run(self):
+        """线程运行函数"""
+        # 轮询结果任务队列
         for result in iter(self.result_queue.get, _TERMINATE):
             future = self.tasks.pop(result.task_id)
+            # 设置执行结果
             _set_future_result(future, result)
         # Ensure that all waiters will receive an exception
         for task_id, future in self.tasks.items():
@@ -103,6 +113,7 @@ class WorkerMonitor(threading.Thread):
         super().__init__(daemon=True)
         self.workers = workers
         self.result_handler = result_handler
+        """结果收集器"""
         self._close = False
 
     def run(self) -> None:
@@ -148,8 +159,11 @@ class ProcessWorkerWrapper:
     def __init__(self, result_handler: ResultHandler,
                  worker_factory: Callable[[], Any]) -> None:
         self._task_queue = mp.Queue()
+        """任务队列 Queue of (task_id, method, args, kwargs)"""
         self.result_queue = result_handler.result_queue
-        self.tasks = result_handler.tasks
+        """结果队列"""
+        self.tasks: Dict[uuid.UUID, Union[ResultFuture, asyncio.Future]] = result_handler.tasks
+        """任务ID-Future字典"""
         self.process: BaseProcess = mp.Process(  # type: ignore[attr-defined]
             target=_run_worker_process,
             name="VllmWorkerProcess",
@@ -159,14 +173,17 @@ class ProcessWorkerWrapper:
                 result_queue=self.result_queue,
             ),
             daemon=True)
+        """worker进程"""
 
         self.process.start()
 
     def _enqueue_task(self, future: Union[ResultFuture, asyncio.Future],
                       method: str, args, kwargs):
+        """将Future及其对应的worker方法添加到任务队列"""
         task_id = uuid.uuid4()
         self.tasks[task_id] = future
         try:
+            # 添加任务到任务队列
             self._task_queue.put((task_id, method, args, kwargs))
         except SystemExit:
             raise
@@ -174,12 +191,15 @@ class ProcessWorkerWrapper:
             del self.tasks[task_id]
             raise ChildProcessError("worker died") from e
 
-    def execute_method(self, method: str, *args, **kwargs):
+    def execute_method(self, method: str, *args, **kwargs) -> ResultFuture:
+        """执行worker方法"""
         future: ResultFuture = ResultFuture()
         self._enqueue_task(future, method, args, kwargs)
         return future
 
     async def execute_method_async(self, method: str, *args, **kwargs):
+        """异步执行worker方法"""
+        # 创建一个异步Future
         future = asyncio.get_running_loop().create_future()
         self._enqueue_task(future, method, args, kwargs)
         return await future
@@ -210,8 +230,8 @@ def _run_worker_process(
     _add_prefix(sys.stderr, process_name, pid)
 
     # Initialize worker
-    worker = worker_factory()
-    del worker_factory
+    worker = worker_factory()   # 构造worker对象
+    del worker_factory  # 清除worker工厂函数对象
 
     # Accept tasks from the engine in task_queue
     # and return task output in result_queue
@@ -223,6 +243,7 @@ def _run_worker_process(
             task_id, method, args, kwargs = items
             try:
                 executor = getattr(worker, method)
+                # 执行任务函数得到输出
                 output = executor(*args, **kwargs)
             except SystemExit:
                 raise
@@ -234,6 +255,7 @@ def _run_worker_process(
                     "Exception in worker %s while processing method %s: %s, %s",
                     process_name, method, e, tb)
                 exception = e
+            # 将执行结果添加到结果队列
             result_queue.put(
                 Result(task_id=task_id, value=output, exception=exception))
     except KeyboardInterrupt:

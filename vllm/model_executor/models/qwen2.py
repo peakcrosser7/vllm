@@ -205,6 +205,8 @@ class Qwen2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # 注:需要residual残差张量的原因是将residual-add与LayerNorm进行算子融合
+            #    这也是PP需要额外发送残差张量的原因
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
         hidden_states = self.self_attn(
@@ -232,19 +234,25 @@ class Qwen2Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        self.padding_idx: int = config.pad_token_id
+        """填充token的token-ID"""
+        self.vocab_size: int = config.vocab_size
+        """词汇表大小"""
 
+        # PP第一个stage 或 需要绑定词嵌入层且是PP最后一个stage
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
+            # 词嵌入层
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
             )
         else:
+            # 用于PP的占位层
             self.embed_tokens = PPMissingLayer()
 
+        # 构建模型层(考虑PP以及offload-to-CPU)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Qwen2DecoderLayer(config=config,
@@ -253,7 +261,7 @@ class Qwen2Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank: # PP最后一个stage
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -270,16 +278,16 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank:    # PP的第一个stage
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None
-        else:
+        else:   # 非PP第一个stage
             assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden_states: torch.Tensor = intermediate_tensors["hidden_states"]
+            residual: torch.Tensor = intermediate_tensors["residual"]
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -289,11 +297,13 @@ class Qwen2Model(nn.Module):
                 attn_metadata,
                 residual,
             )
-        if not get_pp_group().is_last_rank:
+        if not get_pp_group().is_last_rank: # 非PP最后一个stage
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
+        
+        # PP最后一个stage
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

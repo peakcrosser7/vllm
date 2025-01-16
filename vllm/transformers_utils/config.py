@@ -110,6 +110,20 @@ def get_config(
     config_format: ConfigFormat = ConfigFormat.AUTO,
     **kwargs,
 ) -> PretrainedConfig:
+    """获取模型配置
+
+    Args:
+        model (Union[str, Path]): _description_
+        trust_remote_code (bool): 是否信任从远程HF上下载的代码
+        revision (Optional[str], optional): _description_. Defaults to None.
+        code_revision (Optional[str], optional): _description_. Defaults to None.
+        rope_scaling (Optional[dict], optional): _description_. Defaults to None.
+        rope_theta (Optional[float], optional): _description_. Defaults to None.
+        config_format (ConfigFormat, optional): _description_. Defaults to ConfigFormat.AUTO.
+
+    Returns:
+        PretrainedConfig: _description_
+    """
     # Separate model folder from file path for GGUF models
 
     is_gguf = check_gguf_file(model)
@@ -297,6 +311,7 @@ def try_get_generation_config(
     trust_remote_code: bool,
     revision: Optional[str] = None,
 ) -> Optional[GenerationConfig]:
+    """尝试获取模型的文本生成配置"""
     try:
         return GenerationConfig.from_pretrained(
             model,

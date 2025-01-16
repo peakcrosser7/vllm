@@ -19,6 +19,7 @@ class DistributedGPUExecutor(GPUExecutor):
         # This is non-None when the execute model loop is running
         # in the parallel workers. It's a coroutine in the AsyncLLMEngine case.
         self.parallel_worker_tasks: Optional[Union[Any, Awaitable[Any]]] = None
+        """远端TP非主worker的模型执行理循环的Future句柄/异步任务"""
         # Updated by implementations that require additional args to be passed
         # to the _run_workers execute_model call
         self.extra_execute_model_run_workers_kwargs: Dict[str, Any] = {}
@@ -36,7 +37,7 @@ class DistributedGPUExecutor(GPUExecutor):
             - tuple[num_gpu_blocks, num_cpu_blocks]
         """
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        num_blocks = self._run_workers("determine_num_available_blocks", )
+        num_blocks: List[Tuple[int, int]] = self._run_workers("determine_num_available_blocks", )
 
         # Since we use a shared centralized controller, we take the minimum
         # number of blocks across all workers to make sure all the memory
@@ -60,6 +61,7 @@ class DistributedGPUExecutor(GPUExecutor):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+        # 所有worker都进行KV-Cache初始化,CUDA-Graph捕获
         self._run_workers("initialize_cache",
                           num_gpu_blocks=num_gpu_blocks,
                           num_cpu_blocks=num_cpu_blocks)
@@ -69,25 +71,33 @@ class DistributedGPUExecutor(GPUExecutor):
         execute_model_req: ExecuteModelRequest,
     ) -> List[SamplerOutput]:
         if self.parallel_worker_tasks is None:
+            # 远端worker的模型执行循环的Future句柄
             self.parallel_worker_tasks = self._run_workers(
                 "start_worker_execution_loop",
+                # 仅在远端非主worker上异步执行
                 async_run_tensor_parallel_workers_only=True,
                 **self.extra_execute_model_run_workers_kwargs)
 
         # Only the driver worker returns the sampling results.
-        driver_outputs = self._driver_execute_model(execute_model_req)
+        # 主worker执行模型推理,其他worker在模型执行循环中接收到模型输入同样进行模型推理
+        # 注:仅主worker进行token采样
+        driver_outputs: Optional[List[SamplerOutput]] = self._driver_execute_model(execute_model_req)
         assert driver_outputs is not None
         return driver_outputs
 
     def stop_remote_worker_execution_loop(self) -> None:
+        """停止远端worker的模型执行循环"""
         if self.parallel_worker_tasks is None:
             return
 
+        # 主worker执行空请求,会广播空请求到其他远端worker,
+        # 从而停止远端worker的模型执行循环
         self._driver_execute_model(execute_model_req=None)
         parallel_worker_tasks = self.parallel_worker_tasks
         self.parallel_worker_tasks = None
         # Ensure that workers exit model loop cleanly
         # (this will raise otherwise)
+        # 等待远端worker的模型执行循环的Future句柄执行结束
         self._wait_for_tasks_completion(parallel_worker_tasks)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -168,12 +178,15 @@ class DistributedGPUExecutorAsync(DistributedGPUExecutor, ExecutorAsyncBase):
     async def execute_model_async(
             self,
             execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
+        """异步执行worker模型推理"""
         if self.parallel_worker_tasks is None:
             # Start model execution loop running in the parallel workers
+            # 每个非TP主worker启动模型执行循环
             self.parallel_worker_tasks = asyncio.create_task(
                 self._start_worker_execution_loop())
 
         # Only the driver worker returns the sampling results.
+        # 仅在TP主worker(TP-rank=0)上异步执行模型 (非TP主worker通过接收广播的请求执行模型)
         return await self._driver_execute_model_async(execute_model_req)
 
     async def stop_remote_worker_execution_loop_async(self) -> None:

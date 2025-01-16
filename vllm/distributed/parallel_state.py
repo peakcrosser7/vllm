@@ -42,6 +42,7 @@ from vllm.utils import supports_custom_op
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    """CUDA-stream"""
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -92,6 +93,7 @@ _groups: Dict[str, Callable[[], "GroupCoordinator"]] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
+    """注册rank分组到全局"""
     # looks like Python 3.8 does not understand `ReferenceType`
     _groups[group.unique_name] = weakref.ref(group)  # type: ignore
 
@@ -138,8 +140,11 @@ class GroupCoordinator:
 
     # available attributes:
     rank: int  # global rank
+    """全局rank号"""
     ranks: List[int]  # global ranks in the group
+    """当前进程分组的全局rank列表"""
     world_size: int  # size of the group
+    """总rank分组大小"""
     # difference between `local_rank` and `rank_in_group`:
     # if we have a group of size 4 across two nodes:
     # Process | Node | Rank | Local Rank | Rank in Group
@@ -148,7 +153,9 @@ class GroupCoordinator:
     #   2     |   1  |  2   |     0      |       2
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
+    """本地rank号"""
     rank_in_group: int  # rank inside the group
+    """分组内rank号"""
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
@@ -156,6 +163,7 @@ class GroupCoordinator:
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    """自定义All-Reduce通信器"""
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -174,6 +182,7 @@ class GroupCoordinator:
         _register_group(self)
 
         self.rank = torch.distributed.get_rank()
+        """当前进程在全局的rank号"""
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
@@ -189,7 +198,9 @@ class GroupCoordinator:
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
+                """设备rank分组"""
                 self.cpu_group = cpu_group
+                """CPU的rank分组"""
 
         assert self.cpu_group is not None
         assert self.device_group is not None
@@ -201,6 +212,7 @@ class GroupCoordinator:
 
         self.use_pynccl = use_pynccl
         self.use_custom_allreduce = use_custom_allreduce
+        """是否使用自定义All-Reduce算子"""
         self.use_tpu_communicator = use_tpu_communicator
 
         # lazy import to avoid documentation build error
@@ -465,7 +477,7 @@ class GroupCoordinator:
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
-        """Broadcast the input object.
+        """Broadcast the input object by CPU group.
         NOTE: `src` is the local rank of the source rank.
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
@@ -477,11 +489,13 @@ class GroupCoordinator:
             assert src == 0, "Message queue broadcaster only supports src=0"
             return self.mq_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
+            # 源rank进行广播
             torch.distributed.broadcast_object_list([obj],
                                                     src=self.ranks[src],
                                                     group=self.cpu_group)
             return obj
         else:
+            # 其他rank接收
             recv = [None]
             torch.distributed.broadcast_object_list(recv,
                                                     src=self.ranks[src],
@@ -617,6 +631,7 @@ class GroupCoordinator:
                                                          group=group,
                                                          async_op=True)
                 async_handles.append(handle)
+            # 等待所有张量发送完毕
             for async_handle in async_handles:
                 async_handle.wait()
 
@@ -677,6 +692,7 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         if dst is None:
+            # 默认发送目标是下一PP-stage
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
@@ -696,7 +712,8 @@ class GroupCoordinator:
 
             # send-allgather: send only a slice, then do allgather.
             if (all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0):
+                    and tensor.numel() % all_gather_size == 0): # 张量中的元素数可以被all_gather_size整除
+                # 将张量切片用于发送
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             if tensor.is_cpu:
@@ -732,6 +749,7 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         if src is None:
+            # 默认上一个PP-stage
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -753,6 +771,7 @@ class GroupCoordinator:
 
                 if use_all_gather:
                     orig_shape = tensor.shape
+                    # 将张量按照all_gather_size的大小划分张量形状
                     tensor = tensor.reshape(all_gather_size,
                                             -1)[all_gather_rank]
 
@@ -768,8 +787,10 @@ class GroupCoordinator:
                                            group=group)
                 if use_all_gather:
                     # do the allgather
+                    # 使用All-Gather得到完整张量
                     tensor = all_gather_group.all_gather(  # type: ignore
                         tensor, dim=0)
+                    # 重置为原本张量形状
                     tensor = tensor.reshape(orig_shape)
 
                 tensor_dict[key] = tensor
@@ -840,6 +861,7 @@ def get_world_group() -> GroupCoordinator:
 
 def init_world_group(ranks: List[int], local_rank: int,
                      backend: str) -> GroupCoordinator:
+    """初始化当前进程的本地rank号在全局rank分组的设置"""
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -920,6 +942,7 @@ def graph_capture():
 logger = init_logger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
+"""是否启用自定义All-Reduce算子"""
 
 
 def set_custom_all_reduce(enable: bool):

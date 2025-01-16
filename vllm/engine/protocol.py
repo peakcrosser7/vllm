@@ -27,10 +27,12 @@ class EngineClient(Protocol):
 
     @property
     def errored(self) -> bool:
+        """客户端是否已发生错误"""
         ...
 
     @property
     def dead_error(self) -> BaseException:
+        """引擎宕机错误"""
         ...
 
     def generate(
@@ -79,6 +81,7 @@ class EngineClient(Protocol):
         ...
 
     async def is_tracing_enabled(self) -> bool:
+        """是否启用了追踪器"""
         ...
 
     async def do_log_stats(

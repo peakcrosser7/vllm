@@ -119,6 +119,7 @@ _MODELS = {
 # Architecture -> type.
 # out of tree models
 _OOT_MODELS: Dict[str, Type[nn.Module]] = {}
+"""架构->Out-of-Tree模型的字典"""
 
 # Models not supported by ROCm.
 _ROCM_UNSUPPORTED_MODELS: List[str] = []
@@ -177,6 +178,18 @@ class ModelRegistry:
     @staticmethod
     def resolve_model_cls(
             architectures: List[str]) -> Tuple[Type[nn.Module], str]:
+        """
+        解析当前模型架构列表中vLLM所支持的一个模型类
+
+        Args:
+            architectures (List[str]): 所需的模型架构名称列表
+
+        Raises:
+            ValueError: 模型架构不支持
+
+        Returns:
+            Tuple[Type[nn.Module], str]: vLLM支持的模型类与对应的模型架构名称
+        """
         for arch in architectures:
             model_cls = ModelRegistry._try_load_model_cls(arch)
             if model_cls is not None:
@@ -206,6 +219,7 @@ class ModelRegistry:
 
     @staticmethod
     def is_multimodal_model(model_arch: str) -> bool:
+        """是否是多模态模型"""
 
         # TODO: find a way to avoid initializing CUDA prematurely to
         # use `supports_multimodal` to determine if a model is multimodal

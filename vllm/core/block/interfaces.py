@@ -10,6 +10,12 @@ class Block(ABC):
 
     @abstractmethod
     def append_token_ids(self, token_ids: List[int]) -> None:
+        """Appends the given token IDs to the block.
+
+        Args:
+            token_ids (Optional[List[int]]): The token IDs to be appended 
+                to the block.
+        """
         pass
 
     @property
@@ -100,6 +106,16 @@ class BlockAllocator(ABC):
 
     @abstractmethod
     def allocate_mutable_block(self, prev_block: Optional[Block]) -> Block:
+        """Allocates a new mutable block, linked to the previous block.
+
+        Args:
+            prev_block (Optional[Block]): The previous block in the sequence. If
+                None, then the block to be allocated is the first block in the
+                sequence.
+
+        Returns:
+            Block: The newly allocated mutable block.
+        """
         pass
 
     @abstractmethod
@@ -119,6 +135,16 @@ class BlockAllocator(ABC):
 
     @abstractmethod
     def fork(self, last_block: Block) -> List[Block]:
+        """Creates a new sequence of blocks that shares the same underlying
+            memory as the original sequence.
+
+        Args:
+            last_block (Block): The last block in the original sequence.
+
+        Returns:
+            List[Block]: A new list of blocks that shares the same memory as the
+                original sequence.
+        """
         pass
 
     @abstractmethod
@@ -172,7 +198,12 @@ class BlockAllocator(ABC):
 
     @abstractmethod
     def cow_block_if_not_appendable(self, block: Block) -> BlockId:
-        """NOTE: This should not be used besides Block"""
+        """
+        Performs a copy-on-write operation on the given block if it is not
+        appendable.
+        
+        NOTE: This should not be used besides Block
+        """
         pass
 
     @abstractmethod
@@ -200,6 +231,16 @@ class DeviceAwareBlockAllocator(ABC):
     @abstractmethod
     def allocate_mutable_block(self, prev_block: Optional[Block],
                                device: Device) -> Block:
+        """Allocates a new mutable block, linked to the previous block.
+
+        Args:
+            prev_block (Optional[Block]): The previous block in the sequence. If
+                None, then the block to be allocated is the first block in the
+                sequence.
+
+        Returns:
+            Block: The newly allocated mutable block.
+        """
         pass
 
     @abstractmethod
@@ -212,10 +253,33 @@ class DeviceAwareBlockAllocator(ABC):
     def allocate_immutable_blocks(self, prev_block: Optional[Block],
                                   block_token_ids: List[List[int]],
                                   device: Device) -> List[Block]:
+        """Allocates a new group of immutable blocks with the provided block 
+        token IDs on the specified device.
+
+        Args:
+            prev_block (Optional[Block]): The previous block in the sequence.
+                Used for prefix hashing.
+            block_token_ids (List[int]): The list of block token IDs to be 
+                stored in the new blocks.
+            device (Device): The device on which to allocate the new block.
+
+        Returns:
+            List[Block]: The newly allocated list of immutable blocks 
+                containing the provided block token IDs.
+        """
         pass
 
     @abstractmethod
     def get_num_free_blocks(self, device: Device) -> int:
+        """Returns the number of free blocks available on the specified device.
+
+        Args:
+            device (Device): The device for which to query the number of free
+                blocks. AssertionError is raised if None is passed.
+
+        Returns:
+            int: The number of free blocks available on the specified device.
+        """
         pass
 
     @abstractmethod
@@ -228,6 +292,16 @@ class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
     def fork(self, last_block: Block) -> List[Block]:
+        """Creates a new sequence of blocks that shares the same underlying
+            memory as the original sequence.
+
+        Args:
+            last_block (Block): The last block in the original sequence.
+
+        Returns:
+            List[Block]: A new list of blocks that shares the same memory as the
+                original sequence.
+        """
         pass
 
     @property
@@ -237,6 +311,13 @@ class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
     def clear_copy_on_writes(self) -> List[Tuple[int, int]]:
+        """Clears the copy-on-write (CoW) state and returns the mapping of
+            source to destination block IDs.
+
+        Returns:
+            List[Tuple[int, int]]: A list mapping source block IDs to 
+                destination block IDs.
+        """
         pass
 
     @abstractmethod

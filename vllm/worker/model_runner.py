@@ -44,7 +44,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.prompt_adapter.worker_manager import (
     LRUCacheWorkerPromptAdapterManager)
 from vllm.sampling_params import SamplingParams
-from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
+from vllm.sequence import IntermediateTensors, SequenceData, SequenceGroupMetadata
 from vllm.utils import (DeviceMemoryProfiler, PyObjectCache, async_tensor_h2d,
                         flatten_2d_lists, is_hip, is_pin_memory_available,
                         supports_dynamo)
@@ -72,6 +72,7 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 1025)
 ]
 _NUM_WARMUP_ITERS = 2
+"""模型前向推理的预热次数"""
 
 TModelInputForGPU = TypeVar('TModelInputForGPU', bound="ModelInputForGPU")
 
@@ -89,7 +90,9 @@ class ModelInputForGPU(ModelRunnerInputBase):
     additional fields.
     """
     input_tokens: Optional[torch.Tensor] = None
+    """输入token的在词汇表中的索引张量"""
     input_positions: Optional[torch.Tensor] = None
+    """输入token的位置索引"""
     seq_lens: Optional[List[int]] = None
     query_lens: Optional[List[int]] = None
     lora_mapping: Optional["LoRAMapping"] = None
@@ -99,9 +102,13 @@ class ModelInputForGPU(ModelRunnerInputBase):
     prompt_adapter_requests: Optional[Set[PromptAdapterRequest]] = None
     multi_modal_kwargs: Optional[BatchedTensorInputs] = None
     request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
+    """请求ID与序列IDs的映射字典"""
     finished_requests_ids: Optional[List[str]] = None
+    """已完成的请求ID列表"""
     virtual_engine: int = 0
+    """PP的虚拟引擎ID"""
     async_callback: Optional[Callable] = None
+    """模型正向推理后的异步回调函数"""
     seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None
     scheduler_outputs: Optional[SchedulerOutputs] = None
 
@@ -139,9 +146,11 @@ class ModelInputForGPUWithSamplingMetadata(ModelInputForGPU):
     Used by the ModelRunner.
     """
     sampling_metadata: Optional["SamplingMetadata"] = None
+    """输出采样的元数据"""
     # Used for speculative decoding. We do not broadcast it because it is only
     # used by the driver worker.
     is_prompt: Optional[bool] = None
+    """是否是prefill请求"""
 
     def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
         tensor_dict = {
@@ -241,7 +250,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
             # Whether the prefix cache is hit (prefill only).
             prefix_cache_hit: bool = False,
-            reinit: bool = False,
+            reinit: bool = False,   # 是否是重新调用构造函数
             reinit_use_defaults: bool = False,
             encoder_seq_len: int = 0,
         ):
@@ -250,16 +259,21 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 for i, seq_id in enumerate(seq_ids):
                     self.seq_ids[i] = seq_id  # type: ignore
             else:
-                self.seq_ids = seq_ids
+                self.seq_ids: List[int] = seq_ids
+                """请求序列ID列表"""
 
-            self.request_id = request_id
+            self.request_id: str = request_id
+            """请求ID"""
             self.is_prompt = is_prompt
+            """是否是带有提示词的序列分组(prefill请求)"""
             self.block_tables = block_tables
             self.computed_block_nums = computed_block_nums
             self.n_seqs = n_seqs
+            """序列数"""
             self.encoder_seq_len = encoder_seq_len
+            """encoder的输入序列长度"""
 
-            if reinit:
+            if reinit:  # 需要重构造
                 if len(self.seq_ids) == 1 and reinit_use_defaults:
                     self.simple_reinit()
                 else:
@@ -367,19 +381,26 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         def __post_init__(self):
             self.n_seqs = len(self.seq_ids)
 
-            self.input_tokens = [[] for _ in range(self.n_seqs)]
+            self.input_tokens: List[List[int]] = [[] for _ in range(self.n_seqs)]
+            """输入token-ID列表"""
             self.input_positions = [[] for _ in range(self.n_seqs)]
+            """输入token位置索引列表"""
             self.mrope_input_positions = None
-            self.seq_lens = [0] * self.n_seqs
+            self.seq_lens: List[int] = [0] * self.n_seqs
+            """序列长度(已计算token数+待计算token数)的列表"""
             self.orig_seq_lens = [0] * self.n_seqs
-            self.query_lens = [0] * self.n_seqs
-            self.context_lens = [0] * self.n_seqs
+            """序列长度(已计算token数+待计算token数)的列表"""
+            self.query_lens: List[int] = [0] * self.n_seqs
+            """Attention的Q矩阵的序列长度"""
+            self.context_lens: List[int] = [0] * self.n_seqs
+            """已计算的上下文token长度列表"""
             self.curr_sliding_window_blocks = [0] * self.n_seqs
 
             self.lora_index_mapping = []
             self.lora_prompt_mapping = []
 
     def gen_inter_data_builder(self, num_seqs: int):
+        """获取生成中间数据的构造器(构造函数)"""
         return lambda: ModelInputForGPUBuilder.InterDataForSeqGroup(
             request_id="",
             seq_ids=[0] * num_seqs,
@@ -388,22 +409,26 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             computed_block_nums=[])
 
     def init_cached_inter_data(self, *args, **kwargs):
+        """初始化并构造缓存的中间数据"""
         assert len(args) == 0
         assert "seq_ids" in kwargs
         seq_ids = kwargs["seq_ids"]
-        num_seqs = len(seq_ids)
+        num_seqs = len(seq_ids) # 请求序列数
 
         # The inter-data cache is per model_runner
         inter_data_cache = self.runner.inter_data_cache
         if num_seqs not in inter_data_cache:
+            # 分配并缓存对象
             inter_data_cache[num_seqs] = PyObjectCache(
                 self.gen_inter_data_builder(num_seqs))
 
         obj = inter_data_cache[num_seqs].get_object()
+        # 主动重新构造对象
         obj.__init__(*args, **kwargs)
         return obj
 
     def reset_cached_inter_data(self):
+        """重置缓存的模型输入中间数据"""
         for cache in self.runner.inter_data_cache.values():
             cache.reset()
 
@@ -428,21 +453,27 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         self.runner = runner
         self.model_input_cls = self.runner._model_input_cls
+        """模型输入数据类"""
         self.attn_backend = self.runner.attn_backend
+        """Attention后端"""
         self.scheduler_config = self.runner.scheduler_config
         self.sliding_window = self.runner.sliding_window
+        """滑动窗口大小"""
         self.block_size = self.runner.block_size
+        """PageAttention分块大小"""
         self.enable_lora = self.runner.lora_config is not None
         self.enable_prompt_adapter = (self.runner.prompt_adapter_config
                                       is not None)
         self.multi_modal_input_mapper = self.runner.multi_modal_input_mapper
         self.finished_requests_ids = finished_requests_ids
         self.decode_only = True
+        """是否只有decode请求的输入数据"""
 
         # Intermediate data (data in CPU before going to GPU) for
         # the current sequence group.
         self.inter_data_list: List[
             ModelInputForGPUBuilder.InterDataForSeqGroup] = []
+        """模型输入的中间数据列表"""
 
         # Attention metadata inputs.
         self.attn_metadata_builder = self.attn_backend.make_metadata_builder(
@@ -452,38 +483,48 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.chunked_prefill_enabled = (
             self.scheduler_config is not None
             and self.scheduler_config.chunked_prefill_enabled)
+        """是否启用chunked-prefill"""
         if self.sliding_window is not None:
             self.sliding_window_blocks = (
                 self.sliding_window + self.block_size - 1) // self.block_size
+            """滑动窗口分块数"""
             self.block_aligned_sliding_window = \
                 self.sliding_window_blocks * self.block_size
+            """PageAttention分块对齐后的滑动窗口大小"""
 
     def _compute_lens(self, inter_data: InterDataForSeqGroup, seq_idx: int,
                       seq_group_metadata: SequenceGroupMetadata):
         """Compute context length, sequence length and tokens
         for the given sequence data.
         """
-        seq_data = seq_group_metadata.seq_data[inter_data.seq_ids[seq_idx]]
+        seq_data: SequenceData = seq_group_metadata.seq_data[inter_data.seq_ids[seq_idx]]
         token_chunk_size = seq_group_metadata.token_chunk_size
 
         # Compute context length (the number of tokens that are
         # already computed) and sequence length (total number of tokens).
         seq_len = seq_data.get_len()
         if inter_data.is_prompt:
+            # 已处理的token数(即上下文的token数)
             context_len = seq_data.get_num_computed_tokens()
         else:
             # get_num_computed_tokens is incorrect for spec decoding.
             # So, we should have a special logic here.
             # TODO(sang): Fix it.
+            # decode请求的序列只有一个是输入(待计算的token),
+            # 其他都是已处理过的上下文token
             context_len = seq_len - 1
+        # 可能已处理的token数+待处理的token数仍比序列总长度要小(chunked-prefill)
+        # 此时seq_len表示当前序列在本次计算后处理的token总数
         seq_len = min(seq_len, context_len + token_chunk_size)
 
         # Compute tokens.
-        if inter_data.is_prompt:
-            tokens = seq_data.get_token_ids()
+        if inter_data.is_prompt:    # prefill请求
+            tokens = seq_data.get_token_ids()   # 序列的全部提示词token
+            # 有已经计算过的token或者已处理的token数+待处理的token数仍比序列总长度要小(chunked-prefill)
             if context_len != 0 or seq_len < len(tokens):
+                # 本次chunked-prefill计算的提示词token
                 tokens = tokens[context_len:seq_len]
-        else:
+        else:   # decode请求
             # Optimization. get_token_ids requires the entire copy of
             # tokens.
             tokens = seq_data.get_last_token_id()
@@ -696,31 +737,33 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
         """Add a sequence group to the builder."""
-        seq_ids = seq_group_metadata.seq_data.keys()
+        # 请求ID列表
+        seq_ids: List[int] = seq_group_metadata.seq_data.keys()
         n_seqs = len(seq_ids)
         is_prompt = seq_group_metadata.is_prompt
 
         if is_prompt:
-            assert n_seqs == 1
-            self.decode_only = False
+            assert n_seqs == 1  # prefill请求的序列分组只能由一个序列
+            self.decode_only = False    # 有prefill请求的数据了
 
         encoder_seq_len = 0
 
         if self.runner.model_config.is_encoder_decoder_model:
             encoder_seq_len = seq_group_metadata.encoder_seq_data.get_len()
 
-        inter_data = self.init_cached_inter_data(
+        inter_data: ModelInputForGPUBuilder.InterDataForSeqGroup = self.init_cached_inter_data(
             request_id=seq_group_metadata.request_id,
             seq_ids=seq_ids,
             is_prompt=is_prompt,
             block_tables=seq_group_metadata.block_tables,
             computed_block_nums=seq_group_metadata.computed_block_nums,
-            reinit=True,
+            reinit=True,    # 重构造 (初始缓存时构造了一次,设置实际数据时要主动重新构造一次)
             reinit_use_defaults=True,
             encoder_seq_len=encoder_seq_len)
 
         self.inter_data_list.append(inter_data)
 
+        # 为每个序列以及每个序列分组执行相应的计算函数
         for seq_idx in range(n_seqs):
             for per_seq_fn in self.per_seq_compute_fns:
                 per_seq_fn(inter_data, seq_idx, seq_group_metadata)
@@ -731,6 +774,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                             batch_size: int,
                             max_decode_seq_len: int,
                             max_encoder_seq_len: int = 0) -> bool:
+        """是否可以使用CUDA-Graph"""
         return (self.decode_only and not self.runner.model_config.enforce_eager
                 and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
                 and max_decode_seq_len <= self.runner.max_seq_len_to_capture
@@ -742,12 +786,13 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         create on-device tensors.
         """
         # Combine and flatten intermediate data.
-        input_tokens = []
+        input_tokens: List[int] = []   # 输入token列表
+        # 添加每个序列分组的每个序列的输入token
         for inter_data in self.inter_data_list:
             for cur_input_tokens in inter_data.input_tokens:
                 input_tokens.extend(cur_input_tokens)
 
-        if not input_tokens:
+        if not input_tokens:    # 没有输入token
             # This may happen when all prefill requests hit
             # prefix caching and there is no decode request.
             return self.model_input_cls()
@@ -769,14 +814,14 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                                 _seq_mrope_input_positions[idx])
             input_positions = None
         else:
-            input_positions = []
+            input_positions: List[int] = []
             for inter_data in self.inter_data_list:
                 for cur_input_positions in inter_data.input_positions:
                     input_positions.extend(cur_input_positions)
 
         seq_lens = []
         query_lens = []
-        max_decode_seq_len = 0
+        max_decode_seq_len = 0  # 最大的decode请求的序列长度
         max_encoder_seq_len = 0
         for inter_data in self.inter_data_list:
             seq_lens.extend(inter_data.seq_lens)
@@ -804,7 +849,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         # If cuda graph can be used, pad tensors accordingly.
         # See `capture_model` API for more details.
         # vLLM uses cuda graph only for decoding requests.
-        cuda_graph_pad_size = -1
+        cuda_graph_pad_size = -1    # 使用CUDA-Graph时需要填充的token数
         if use_captured_graph:
             graph_batch_size = _get_graph_batch_size(batch_size)
             assert graph_batch_size >= batch_size
@@ -813,8 +858,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         # Tokens and positions.
         if cuda_graph_pad_size:
+            # 填充token以对齐
             input_tokens.extend(itertools.repeat(0, cuda_graph_pad_size))
         assert self.runner.device is not None
+        # 输入token张量 shape(n_tokens,)
         input_tokens_tensor = async_tensor_h2d(input_tokens, torch.long,
                                                self.runner.device,
                                                self.runner.pin_memory)
@@ -828,6 +875,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                                                       self.runner.pin_memory)
         else:
             input_positions.extend(itertools.repeat(0, cuda_graph_pad_size))
+            # 输入token位置索引张量 shape(n_tokens,)
             input_positions_tensor = async_tensor_h2d(input_positions,
                                                       torch.long,
                                                       self.runner.device,
@@ -913,7 +961,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     Helper class for shared methods between GPU model runners.
     """
     _model_input_cls: Type[TModelInputForGPU]
+    """模型输入数据类"""
     _builder_cls: Type[ModelInputForGPUBuilder]
+    """模型输入数据的构造类 (由SequenceGroupMetadata构建模型输入数据)"""
 
     def __init__(
         self,
@@ -940,28 +990,40 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.lora_config = lora_config
         self.load_config = load_config
         self.is_driver_worker = is_driver_worker
+        """是否是主worker"""
         self.prompt_adapter_config = prompt_adapter_config
         self.return_hidden_states = return_hidden_states
+        """是否返回模型正向推理最后的hidden-states"""
         self.observability_config = observability_config
 
         self.device = self.device_config.device
-        self.pin_memory = is_pin_memory_available()
+        """硬件设备类型"""
+        self.pin_memory: bool = is_pin_memory_available()
+        """是否支持锁页内存"""
 
         self.kv_cache_dtype = kv_cache_dtype
+        """KV-Cache存储数据类型"""
         self.sliding_window = model_config.get_sliding_window()
+        """滑动窗口大小"""
         self.block_size = cache_config.block_size
+        """PageAttention分块大小"""
         self.max_seq_len_to_capture = self.model_config.max_seq_len_to_capture
+        """CUDA-Graph可捕获的最大序列长度"""
         self.max_batchsize_to_capture = _get_max_graph_batch_size(
             self.scheduler_config.max_num_seqs)
+        """实际CUDA-Graph可捕获的最大序列长度"""
 
         self.graph_runners: List[Dict[int, CUDAGraphRunner]] = [
             {} for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
+        """每个PP-rank的相应batch_sz的CUDAGraphRunner"""
         self.graph_memory_pool: Optional[Tuple[
             int, int]] = None  # Set during graph capture.
+        """CUDA-Graph内存池的ID"""
 
         self.has_seqlen_agnostic = model_config.contains_seqlen_agnostic_layers(
             parallel_config)
+        """是否包含与序列长度无关的层"""
 
         # When using CUDA graph, the input block tables must be padded to
         # max_seq_len_to_capture. However, creating the block table in
@@ -969,7 +1031,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         # in numpy and only copy the actual input content at every iteration.
         # The shape of the cached block table will be
         # (max batch size to capture, max context len to capture / block size).
-        self.graph_block_tables = np.zeros(
+        # shape[max_graph_bs, max_block_per_batch]
+        self.graph_block_tables: np.ndarray = np.zeros(
             (self.max_batchsize_to_capture, self.get_max_block_per_batch()),
             dtype=np.int32)
         num_attn_heads = self.model_config.get_num_attention_heads(
@@ -983,9 +1046,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
             self.kv_cache_dtype,
             self.block_size,
         ) if num_attn_heads else None
+        """Attention后端类"""
         if self.attn_backend:
             self.attn_state = self.attn_backend.get_state_cls()(
                 weakref.proxy(self))
+            """Attention状态"""
         else:
             self.attn_state = CommonAttentionState(weakref.proxy(self))
 
@@ -998,6 +1063,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         # Lazy initialization
         self.model: nn.Module  # Set after load_model
+        """推理使用的模型"""
         # Set after load_model.
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
         self.prompt_adapter_manager: LRUCacheWorkerPromptAdapterManager = None
@@ -1007,10 +1073,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         # Used to cache python objects
         self.inter_data_cache: Dict[int, PyObjectCache] = {}
+        """模型输入的中间数据的缓存字典 (请求序列数 -> 缓存对象)"""
         self.sampling_metadata_cache: SamplingMetadataCache = \
             SamplingMetadataCache()
+        """采样元数据缓存"""
 
     def load_model(self) -> None:
+        """构建模型并加载权重"""
         logger.info("Starting to load model %s...", self.model_config.model)
         with DeviceMemoryProfiler() as m:
             self.model = get_model(model_config=self.model_config,
@@ -1021,6 +1090,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                    scheduler_config=self.scheduler_config,
                                    cache_config=self.cache_config)
 
+        # 模型使用的内存大小
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
@@ -1114,6 +1184,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         )
 
     def get_max_block_per_batch(self) -> int:
+        """每个批次最大的PageAttention分块数"""
         block_size = self.block_size
         return (self.max_seq_len_to_capture + block_size - 1) // block_size
 
@@ -1136,12 +1207,16 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         If cuda graph is required, this API automatically pads inputs.
         """
+        # 模型输入数据的构造器
         builder = self._builder_cls(weakref.proxy(self), finished_requests_ids)
+        # 添加所有的序列分组到构造器
         for seq_group_metadata in seq_group_metadata_list:
             builder.add_seq_group(seq_group_metadata)
 
+        # 重置缓存
         builder.reset_cached_inter_data()
 
+        # 构建模型输入数据及张量
         return builder.build()  # type: ignore
 
     @torch.inference_mode()
@@ -1199,6 +1274,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 max_num_seqs = 1
 
         batch_size = 0
+        # 构建max_num_seqs条序列数据
         for group_id in range(max_num_seqs):
             seq_len = (max_num_batched_tokens // max_num_seqs +
                        (group_id < max_num_batched_tokens % max_num_seqs))
@@ -1225,14 +1301,15 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
         finished_requests_ids = [seq.request_id for seq in seqs]
-        model_input = self.prepare_model_input(
+        model_input: TModelInputForGPU = self.prepare_model_input(
             seqs, finished_requests_ids=finished_requests_ids)
         intermediate_tensors = None
-        if not get_pp_group().is_first_rank:
-            intermediate_tensors = self.model.make_empty_intermediate_tensors(
+        if not get_pp_group().is_first_rank:    # 非PP第一个stage
+            intermediate_tensors: IntermediateTensors = self.model.make_empty_intermediate_tensors(
                 batch_size=batch_size,
                 dtype=self.model_config.dtype,
                 device=self.device)
+        # 执行模型前向推理及采样
         self.execute_model(model_input, kv_caches, intermediate_tensors)
         torch.cuda.synchronize()
         return
@@ -1339,6 +1416,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         # Prepare dummy inputs. These will be reused for all batch sizes.
         max_batch_size = self.max_batchsize_to_capture
+        # shape[match_batch_sz,]
         input_tokens = torch.zeros(max_batch_size, dtype=torch.long).cuda()
         input_positions = torch.zeros(max_batch_size, dtype=torch.long).cuda()
         if self.model_is_mrope:
@@ -1348,6 +1426,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         previous_hidden_states = None
         if "previous_hidden_states" in inspect.signature(
                 self.model.forward).parameters:
+            # shape[match_batch_sz, hidden_sz]
             previous_hidden_states = torch.empty(
                 [max_batch_size,
                  self.model_config.get_hidden_size()],
@@ -1355,8 +1434,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 device=self.device)
 
         intermediate_inputs = None
-        if not get_pp_group().is_first_rank:
-            intermediate_inputs = self.model.make_empty_intermediate_tensors(
+        if not get_pp_group().is_first_rank:    # 不是PP第一个stage
+            intermediate_inputs: IntermediateTensors = self.model.make_empty_intermediate_tensors(
                 batch_size=max_batch_size,
                 dtype=self.model_config.dtype,
                 device=self.device)
@@ -1368,6 +1447,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         ] * self.parallel_config.pipeline_parallel_size
 
         graph_batch_size = self.max_batchsize_to_capture
+        # 所有小于等于"CUDA-Graph可捕获的最大序列长度"的CUDA-Graph的batch_sz
         batch_size_capture_list = [
             bs for bs in _BATCH_SIZES_TO_CAPTURE if bs <= graph_batch_size
         ]
@@ -1516,12 +1596,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         If cuda graph is required, this API automatically pads inputs.
         """
-        model_input = self._prepare_model_input_tensors(
+        # 预处理模型输入数据
+        model_input: ModelInputForGPUWithSamplingMetadata = self._prepare_model_input_tensors(
             seq_group_metadata_list, finished_requests_ids)
         if get_pp_group().is_last_rank:
             # Sampling metadata is only required for the final pp group
-            generators = self.get_generators(finished_requests_ids)
-            sampling_metadata = SamplingMetadata.prepare(
+            generators: torch.Generator = self.get_generators(finished_requests_ids)
+            # 构建采样元数据
+            sampling_metadata: SamplingMetadata = SamplingMetadata.prepare(
                 seq_group_metadata_list, model_input.seq_lens,
                 model_input.query_lens, self.device, self.pin_memory,
                 generators, self.sampling_metadata_cache)
@@ -1563,18 +1645,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         # Currently cuda graph is only supported by the decode phase.
         assert model_input.attn_metadata is not None
-        prefill_meta = model_input.attn_metadata.prefill_metadata
-        decode_meta = model_input.attn_metadata.decode_metadata
+        prefill_meta: Optional[AttentionMetadata] = model_input.attn_metadata.prefill_metadata
+        decode_meta: Optional[AttentionMetadata] = model_input.attn_metadata.decode_metadata
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
-        virtual_engine = model_input.virtual_engine
+        virtual_engine = model_input.virtual_engine     # PP-rank对应的虚拟引擎ID
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
-            model_executable = self.graph_runners[virtual_engine][
+            # 对应PP-stage虚拟引擎以及batch_sz的CUDA-Graph模型
+            model_executable: CUDAGraphRunner = self.graph_runners[virtual_engine][
                 graph_batch_size]
         else:
-            model_executable = self.model
+            model_executable: nn.Module = self.model
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
@@ -1587,7 +1670,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
-        hidden_or_intermediate_states = model_executable(
+        # 执行模型前向推理
+        hidden_or_intermediate_states: Union[IntermediateTensors, torch.Tensor] = model_executable(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
             kv_caches=kv_caches,
@@ -1602,34 +1686,47 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end.record()
 
         # Compute the logits in the last pipeline stage.
+        # 不是PP的最后一个stage则计算执行时间后就返回
         if not get_pp_group().is_last_rank:
-            if (self.is_driver_worker
-                    and hidden_or_intermediate_states is not None
+            if (self.is_driver_worker   # 是主worker
+                    and hidden_or_intermediate_states is not None   # 有模型推理结果
                     and isinstance(hidden_or_intermediate_states,
-                                   IntermediateTensors)
+                                   IntermediateTensors)             # 是PP的模型推理结果
                     and self.observability_config is not None
-                    and self.observability_config.collect_model_forward_time):
-                model_forward_end.synchronize()
+                    and self.observability_config.collect_model_forward_time):  # 需要收集模型前向用时
+                model_forward_end.synchronize() # 同步
                 model_forward_time = model_forward_start.elapsed_time(
                     model_forward_end)
                 orig_model_forward_time = 0.0
                 if intermediate_tensors is not None:
+                    # 上一stage的模型推理用时
                     orig_model_forward_time = intermediate_tensors.tensors.get(
                         "model_forward_time", torch.tensor(0.0)).item()
+                # 当前stage的模型推理用时要加上上一stage的用时
                 hidden_or_intermediate_states.tensors["model_forward_time"] = (
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
-        logits = self.model.compute_logits(hidden_or_intermediate_states,
+        # 以下仅PP的最后一个stage执行(可能包含多个TP)
+
+        # 计算模型输出的hidden-states的logits shape[num_tokens,vocab_sz]
+        logits: Optional[torch.Tensor] = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 
+        # 非TP-rank为0的主worker不返回结果
         if not self.is_driver_worker:
             return []
 
+        # 以下仅 PP最后一个stage,TP-rank=0 执行
+
+        # 执行异步回调函数
         if model_input.async_callback is not None:
+            # 处理当前PP-stage调度器上下文的模型输出
+            # 注:这里可能是CPU执行时GPU可能仍在计算,从而让CPU处理模型输出与GPU模型推理overlap
             model_input.async_callback()
 
         # Sample the next token.
+        # 对模型输出进行token采样
         output: SamplerOutput = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
@@ -1638,6 +1735,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 and self.observability_config.collect_model_forward_time
                 and output is not None):
             model_forward_end.synchronize()
+            # 计算模型前向用时
             model_forward_time = model_forward_start.elapsed_time(
                 model_forward_end)
             orig_model_forward_time = 0.0
@@ -1651,17 +1749,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             output.model_forward_time = (orig_model_forward_time +
                                          model_forward_time)
 
+        # 需要返回最后的hidden-states
         if self.return_hidden_states:
             # we only need to pass hidden states of most recent token
             assert model_input.sampling_metadata is not None
             indices = model_input.sampling_metadata.selected_token_indices
             if model_input.is_prompt:
+                # 如果不需要返回提示词的对数概率,提示词仅最后一个token有hidden_states
                 hidden_states = hidden_or_intermediate_states.index_select(
                     0, indices)
                 output.prefill_hidden_states = hidden_or_intermediate_states
             elif decode_meta.use_cuda_graph:
                 hidden_states = hidden_or_intermediate_states[:len(indices)]
-            else:
+            else:   # decode but not use CUDA-Graph
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
@@ -1675,7 +1775,9 @@ class CUDAGraphRunner:
                  attn_state: AttentionState, is_encoder_decoder_model: bool):
         self.model = model
         self.backend_name = backend_name
+        """Attention后端类的名称"""
         self.attn_state = attn_state
+        """Attention状态"""
 
         self.input_buffers: Dict[str, torch.Tensor] = {}
         self.output_buffers: Dict[str, torch.Tensor] = {}
@@ -1684,7 +1786,7 @@ class CUDAGraphRunner:
         self._is_encoder_decoder_model = is_encoder_decoder_model
 
     @property
-    def graph(self):
+    def graph(self) -> torch.cuda.CUDAGraph:
         assert self._graph is not None
         return self._graph
 
@@ -1820,7 +1922,9 @@ class CUDAGraphRunner:
 
 
 def _get_graph_batch_size(batch_size: int) -> int:
-    """Returns the padded batch size given actual batch size.
+    """返回对齐后的批次大小
+    
+    Returns the padded batch size given actual batch size.
 
     Batch sizes are 1, 2, 4, _BATCH_SIZE_ALIGNMENT,
     2*_BATCH_SIZE_ALIGNMENT, 3*_BATCH_SIZE_ALIGNMENT...

@@ -6,7 +6,7 @@ from typing import Union
 
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind
-from vllm.sequence import (PromptLogprobs, RequestMetrics, SampleLogprobs,
+from vllm.sequence import (PromptLogprobs, RequestMetrics, SampleLogprobs, Sequence,
                            SequenceGroup, SequenceStatus)
 
 
@@ -30,11 +30,17 @@ class CompletionOutput:
     """
 
     index: int
+    """输出在请求中的索引"""
     text: str
+    """生成的输出文本"""
     token_ids: GenericSequence[int]
+    """生成的输出文本的token-ID"""
     cumulative_logprob: Optional[float]
+    """生成的输出文本的累计对数概率"""
     logprobs: Optional[SampleLogprobs]
+    """每个位置上最高概率的token的对数概率"""
     finish_reason: Optional[str] = None
+    """生成序列完成的原因"""
     stop_reason: Union[int, str, None] = None
     lora_request: Optional[LoRARequest] = None
 
@@ -104,14 +110,20 @@ class RequestOutput:
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
+        """提示词文本"""
         self.prompt_token_ids = prompt_token_ids
+        """提示词的token-ID"""
         self.prompt_logprobs = prompt_logprobs
         self.outputs = outputs
+        """请求的输出序列"""
         self.finished = finished
+        """序列分组生成是否已完成"""
         self.metrics = metrics
+        """时间指标数据"""
         self.lora_request = lora_request
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
+        """encoder提示词的token-ID(带有encoder的模型)"""
 
     @classmethod
     def from_seq_group(cls, seq_group: SequenceGroup,
@@ -122,6 +134,7 @@ class RequestOutput:
                 "Sampling parameters are missing for a CompletionRequest.")
 
         finished = seq_group.is_finished()
+        # 如果只在生成结束后输出结果而序列分组未完成
         if sampling_params.output_kind == RequestOutputKind.FINAL_ONLY and (
                 not finished):
             return None
@@ -136,7 +149,7 @@ class RequestOutput:
                 outputs=[],
                 finished=False)
 
-        seqs = seq_group.get_seqs()
+        seqs: List[Sequence] = seq_group.get_seqs()
         if len(seqs) == 1:
             top_n_seqs = seqs
         else:
@@ -147,6 +160,7 @@ class RequestOutput:
                     sampling_params.length_penalty)
             else:
                 sorting_key = lambda seq: seq.get_cumulative_logprob()
+            # 排序获取前n个序列
             sorted_seqs = sorted(seqs, key=sorting_key, reverse=True)
             top_n_seqs = sorted_seqs[:n]
 
@@ -154,17 +168,19 @@ class RequestOutput:
         # NOTE: We need omit logprobs here explicitly because the sequence
         # always has the logprobs of the sampled tokens even if the
         # logprobs are not requested.
-        include_logprobs = sampling_params.logprobs is not None
+        include_logprobs: bool = sampling_params.logprobs is not None
         text_buffer_length = sampling_params.output_text_buffer_length
-        delta = sampling_params.output_kind == RequestOutputKind.DELTA
+        delta: bool = sampling_params.output_kind == RequestOutputKind.DELTA
 
-        outputs = []
+        outputs: List[CompletionOutput] = []
         include_prompt = True
+        # 遍历每个需要返回的序列
         for i, seq in enumerate(top_n_seqs):
-            output_text = seq.get_output_text_to_return(
+            # 返回的输出文本
+            output_text: str = seq.get_output_text_to_return(
                 text_buffer_length, delta)
 
-            output_token_ids = seq.get_output_token_ids_to_return(delta)
+            output_token_ids: Union[GenericSequence[int], int] = seq.get_output_token_ids_to_return(delta)
             num_output_tokens = 1 if isinstance(output_token_ids,
                                                 int) else len(output_token_ids)
 
@@ -176,12 +192,13 @@ class RequestOutput:
                     output_logprobs = output_logprobs[-num_output_tokens:]
                 # Don't include prompt if this is after the first output
                 # containing decode token ids
+                # 仅在返回生成的第一个token时携带提示词
                 if include_prompt and seq.get_output_len() > num_output_tokens:
                     include_prompt = False
 
-            if use_cache:
+            if use_cache:   # 使用缓存
                 # Get cached output object
-                cached_outputs = seq_group.cached_request_output.outputs  # type: ignore
+                cached_outputs: List[CompletionOutput] = seq_group.cached_request_output.outputs  # type: ignore
                 if i >= len(cached_outputs):
                     cached_outputs.append(
                         CompletionOutput(index=i,
@@ -200,7 +217,7 @@ class RequestOutput:
                 if isinstance(output_token_ids, int):
                     output.token_ids.clear()
                     output.token_ids.append(output_token_ids)
-                else:
+                else:   # List[int]
                     output.token_ids = output_token_ids
 
                 output.cumulative_logprob = seq.get_cumulative_logprob() \
@@ -210,7 +227,7 @@ class RequestOutput:
                     seq.status)
                 output.stop_reason = seq.stop_reason
 
-            else:
+            else:   # 不使用缓存
                 output = CompletionOutput(
                     seqs.index(seq), output_text, [output_token_ids]
                     if isinstance(output_token_ids, int) else output_token_ids,
@@ -243,7 +260,7 @@ class RequestOutput:
                      encoder_prompt_token_ids)
 
         if use_cache:
-            request_output = seq_group.cached_request_output
+            request_output: RequestOutput = seq_group.cached_request_output
             request_output.__init__(*init_args)  # type: ignore
 
         else:

@@ -290,6 +290,7 @@ class CommonAttentionState(AttentionState):
         self._graph_seq_lens = torch.ones(max_batch_size,
                                           dtype=torch.int32,
                                           device=self.runner.device)
+        # shape[max_graph_bs, max_block_per_batch]
         self._graph_block_tables = torch.from_numpy(
             self.runner.graph_block_tables).to(device=self.runner.device)
         yield
