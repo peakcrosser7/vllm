@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
@@ -187,41 +188,48 @@ class Mamba2AttentionMetadataBuilder(
         has_initial_states_p = None
         prep_initial_states = False
 
-        # for causal_conv1d
-        nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        if not envs.VLLM_USE_LIGHTER_MAMBA_CACHE:
+            # for causal_conv1d
+            nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
 
-        num_computed_tokens, num_computed_tokens_p = None, None
-        block_idx_first_scheduled_token = None
-        block_idx_first_scheduled_token_p = None
+            num_computed_tokens, num_computed_tokens_p = None, None
+            block_idx_first_scheduled_token = None
+            block_idx_first_scheduled_token_p = None
 
-        if self.vllm_config.cache_config.enable_prefix_caching:
-            # Return a tensor of shape (#requests, #max blocks)
-            state_indices_tensor = common_attn_metadata.block_table_tensor
-            # Additional cache-related varaiables:
-            mamba_block_size = self.kv_cache_spec.block_size
-            num_computed_tokens = common_attn_metadata.num_computed_tokens_cpu.to(
-                self.device
-            )
-            # Block index of the last computed token
-            block_idx_last_computed_token = (
-                cdiv(num_computed_tokens, mamba_block_size) - 1
-            )
-            # which is <= block index for the first scheduled token
-            block_idx_first_scheduled_token = (
-                cdiv(num_computed_tokens + 1, mamba_block_size) - 1
-            )
-            # which is <= block index of the last scheduled token
-            block_idx_last_scheduled_token = (
-                cdiv(common_attn_metadata.seq_lens, mamba_block_size) - 1
-            )
-            # -1 in case it's non-computed and causes later issues with indexing
-            block_idx_last_computed_token = block_idx_last_computed_token.clamp(min=0)
+            if self.vllm_config.cache_config.enable_prefix_caching:
+                # Return a tensor of shape (#requests, #max blocks)
+                state_indices_tensor = common_attn_metadata.block_table_tensor
+                # Additional cache-related varaiables:
+                mamba_block_size = self.kv_cache_spec.block_size
+                num_computed_tokens = common_attn_metadata.num_computed_tokens_cpu.to(
+                    self.device
+                )
+                # Block index of the last computed token
+                block_idx_last_computed_token = (
+                    cdiv(num_computed_tokens, mamba_block_size) - 1
+                )
+                # which is <= block index for the first scheduled token
+                block_idx_first_scheduled_token = (
+                    cdiv(num_computed_tokens + 1, mamba_block_size) - 1
+                )
+                # which is <= block index of the last scheduled token
+                block_idx_last_scheduled_token = (
+                    cdiv(common_attn_metadata.seq_lens, mamba_block_size) - 1
+                )
+                # -1 in case it's non-computed and causes later issues with indexing
+                block_idx_last_computed_token = block_idx_last_computed_token.clamp(min=0)
+            else:
+                # Always return just a single block per each request:
+                state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0]
+                # Additional cache-related varaiables:
+                block_idx_last_scheduled_token = None
+                block_idx_last_computed_token = None
         else:
-            # Always return just a single block per each request:
-            state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0]
-            # Additional cache-related varaiables:
-            block_idx_last_scheduled_token = None
-            block_idx_last_computed_token = None
+            # NOTE: With Mamba prefix-caching support, a request can consist of
+            # multiple blocks. This makes the state_indices non-contiguous, so
+            # we must explicitly make them contiguous here.
+            state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0] \
+                                                    .contiguous()
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(

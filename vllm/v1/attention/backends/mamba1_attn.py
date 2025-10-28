@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadataBuilder
@@ -45,6 +46,11 @@ class Mamba1AttentionMetadataBuilder(
         query_start_loc = common_attn_metadata.query_start_loc
 
         state_indices_tensor = common_attn_metadata.block_table_tensor[:, 0]
+        if envs.VLLM_USE_LIGHTER_MAMBA_CACHE:
+            # NOTE: With Mamba prefix-caching support, a request can consist of
+            # multiple blocks. This makes the state_indices non-contiguous, so
+            # we must explicitly make them contiguous here.
+            state_indices_tensor = state_indices_tensor.contiguous()
         context_lens_tensor = common_attn_metadata.num_computed_tokens_cpu.to(
             query_start_loc.device
         )
