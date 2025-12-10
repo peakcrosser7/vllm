@@ -157,6 +157,7 @@ from .utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
     gather_mm_placeholders,
+    get_mamba_groups,
     sanity_check_mm_encoder_outputs,
     scatter_mm_placeholders,
 )
@@ -582,6 +583,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.mamba_state_idx: dict[str, list[int]] = {}
 
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
@@ -933,7 +935,7 @@ class GPUModelRunner(
         self.input_batch.refresh_metadata()
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor
+        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update the cached states after model execution.
 
@@ -969,6 +971,17 @@ class GPUModelRunner(
         )
         for i, num_tokens in enumerate(num_accepted_tokens):
             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+        if is_global_first_rank():
+            logger.info(f">>> [DEBUG] Worker: _update_states: {output_token_ids=}")
+            logger.info(
+                f">>> [DEBUG] Worker: _update_states: "
+                f"{self.input_batch.num_accepted_tokens_cpu[:len(num_accepted_tokens)]=}"
+            )
+        if (
+            envs.VLLM_USE_LIGHTER_MAMBA_CACHE
+            and self.cache_config.enable_prefix_caching
+        ):
+            self._postprocess_mamba(scheduler_output)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
@@ -1428,6 +1441,7 @@ class GPUModelRunner(
 
     def _build_attention_metadata(
         self,
+        scheduler_output: "SchedulerOutput",
         total_num_scheduled_tokens: int,
         max_num_scheduled_tokens: int,
         num_reqs: int,
@@ -1527,6 +1541,13 @@ class GPUModelRunner(
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
                 # graph mode.
                 blk_table.slot_mapping.gpu[total_num_scheduled_tokens:].fill_(-1)
+
+                # if (envs.VLLM_USE_LIGHTER_MAMBA_CACHE
+                #     and self.cache_config.enable_prefix_caching
+                #     and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+                # ):
+                #     # NOTE(Chen): where should we put this?
+                #     self._preprocess_mamba(kv_cache_gid, kv_cache_group)
 
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
@@ -2438,7 +2459,10 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        if is_global_first_rank():
+            logger.info(
+                f">>> [DEBUG] Worker: sampler_output: {sampler_output.sampled_token_ids.shape} {sampler_output.sampled_token_ids}"
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -2622,6 +2646,168 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _mamba_copy_block(
+        self,
+        kv_cache_group_spec: KVCacheGroupSpec,
+        src_block_id: int,
+        dest_block_id: int,
+    ):
+        if src_block_id == dest_block_id:
+            return
+        forward_context = self.compilation_config.static_forward_context
+        for layer_name in kv_cache_group_spec.layer_names:
+            kv_caches: list[list[torch.Tensor]] = forward_context[layer_name].kv_cache
+            for kv_cache in kv_caches:
+                if isinstance(kv_cache, torch.Tensor):
+                    kv_cache[dest_block_id].copy_(kv_cache[src_block_id])
+                elif isinstance(kv_cache, list):
+                    for kv_cache_part in kv_cache:
+                        kv_cache_part[dest_block_id].copy_(kv_cache_part[src_block_id])
+
+    def _preprocess_mamba(self, scheduler_output: "SchedulerOutput"):
+        """
+        Copies the mamba state of previous step to the last (1 + num_speculative_blocks) block
+        """
+        mamba_group_ids, mamba_spec = get_mamba_groups(self.kv_cache_config)
+        num_speculative_blocks = mamba_spec.num_speculative_blocks
+        # TODO(Chen): we need to optimize this function a lot
+        assert self.cache_config.enable_prefix_caching
+        block_size = mamba_spec.block_size
+        for req_id in itertools.chain(
+            scheduler_output.finished_req_ids, scheduler_output.preempted_req_ids
+        ):
+            self.mamba_state_idx.pop(req_id, None)
+        for req_id in self.input_batch.req_ids:
+            if is_global_first_rank():
+                logger.info(f">>> [DEBUG] Worker: preprocess mamba for RUN: {req_id=}")
+            req_state = self.requests[req_id]
+            prev_state_idx = self.mamba_state_idx.get(req_id)
+            if prev_state_idx is None:
+                # new / resumed request, no previous state
+                # if num_computed_tokens is 0, prev_state_idx will be -1
+                prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
+
+            num_blocks = len(req_state.block_ids[mamba_group_ids[0]])
+            # We always save the current running state at the last (1 + num_speculative_blocks) block
+            curr_state_idx = num_blocks - 1 - num_speculative_blocks
+            if is_global_first_rank():
+                logger.info(
+                    f">>> [DEBUG] Worker: preprocess mamba: {req_id=}, idx {prev_state_idx=} -> {curr_state_idx=}"
+                )
+            self.mamba_state_idx[req_id] = curr_state_idx
+            if prev_state_idx == -1 or prev_state_idx == curr_state_idx:
+                # no need to copy
+                continue
+            for mamba_group_id in mamba_group_ids:
+                prev_block_id = req_state.block_ids[mamba_group_id][prev_state_idx]
+                curr_block_id = req_state.block_ids[mamba_group_id][curr_state_idx]
+                assert prev_block_id != 0
+                assert curr_block_id != 0
+                if is_global_first_rank():
+                    logger.info(
+                        f">>> [DEBUG] Worker: preprocess mamba: {req_id=}, COPY block {prev_block_id=} -> {curr_block_id=}"
+                    )
+                self._mamba_copy_block(
+                    self.kv_cache_config.kv_cache_groups[mamba_group_id],
+                    prev_block_id,
+                    curr_block_id,
+                )
+
+    def _mamba_copy_block_for_qwen_next(
+        self,
+        kv_cache_group_spec: KVCacheGroupSpec,
+        src_block_idx: int,
+        dest_block_idx: int,
+        accept_token_bias: int,
+        block_ids: list[int],
+    ):
+        # TODO: general impl for all models
+        if src_block_idx == dest_block_idx and accept_token_bias == 0:
+            return
+        forward_context = self.compilation_config.static_forward_context
+        dest_block_id = block_ids[dest_block_idx]
+        for layer_name in kv_cache_group_spec.layer_names:
+            kv_caches: list[list[torch.Tensor]] = forward_context[layer_name].kv_cache[
+                0
+            ]
+            conv_state, gdn_state = kv_caches
+            # conv state
+            conv_state_block_id = block_ids[src_block_idx]
+            src_conv_state = conv_state[conv_state_block_id][accept_token_bias:]
+            dest_conv_state = conv_state[dest_block_id]
+            dest_conv_state[: len(src_conv_state)].copy_(src_conv_state.clone())
+            # gdn state
+            gdn_state_block_id = block_ids[src_block_idx + accept_token_bias]
+            src_gdn_state = gdn_state[gdn_state_block_id]
+            dest_gdn_state = gdn_state[dest_block_id]
+            dest_gdn_state.copy_(src_gdn_state)
+            if (
+                is_global_first_rank()
+                and layer_name == kv_cache_group_spec.layer_names[0]
+            ):
+                logger.info(
+                    f">>> [DEBUG] Worker: mamba_copy_block_for_qwen_next: {layer_name=}, conv {conv_state_block_id=} -> {dest_block_id=} with bias {accept_token_bias}, {gdn_state_block_id=} -> {dest_block_id=}"
+                )
+
+    def _postprocess_mamba(self, scheduler_output: "SchedulerOutput"):
+        """
+        1. If a blocks is converted from partial block to full block in this step, copy
+        2. Unify the state after token acceptance
+           the state from mamba_state_idx to that block
+        """
+        num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+        scheduled_spec_decode_tokens_dict = (
+            scheduler_output.scheduled_spec_decode_tokens
+        )
+        num_accepted_tokens_cpu = self.input_batch.num_accepted_tokens_cpu
+        if is_global_first_rank():
+            logger.info(
+                f">>> [DEBUG] Worker: postprocess mamba {num_scheduled_tokens_dict=} {scheduled_spec_decode_tokens_dict=} {num_accepted_tokens_cpu=}"
+            )
+        # NOTE: can be optimized as this function always returns the same result
+        mamba_group_ids, mamba_spec = get_mamba_groups(self.kv_cache_config)
+        # TODO: vectorize this loop
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+            num_draft_tokens = len(scheduled_spec_decode_tokens_dict.get(req_id, []))
+            num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
+            num_accepted_tokens = num_accepted_tokens_cpu[i]
+            num_tokens_running_state = (
+                num_computed_tokens + num_scheduled_tokens - num_draft_tokens
+            )
+            new_num_computed_tokens = num_tokens_running_state + num_accepted_tokens - 1
+            aligned_new_computed_tokens = (
+                new_num_computed_tokens // mamba_spec.block_size * mamba_spec.block_size
+            )
+            if is_global_first_rank():
+                logger.info(
+                    f">>> [DEBUG] Worker: postprocess mamba: {req_id=}, {num_computed_tokens=}, {num_scheduled_tokens=} {num_draft_tokens=} {num_accepted_tokens=} {num_tokens_running_state=} {new_num_computed_tokens=} {aligned_new_computed_tokens=}"
+                )
+            # TODO: how to ensure all blocks that cache_blocks called are cached here?
+            if aligned_new_computed_tokens >= num_tokens_running_state:
+                accept_token_bias = (
+                    aligned_new_computed_tokens - num_tokens_running_state
+                )
+                src_block_idx = self.mamba_state_idx[req_id]
+                dest_block_idx = (
+                    aligned_new_computed_tokens // mamba_spec.block_size - 1
+                )
+                if is_global_first_rank():
+                    logger.info(
+                        f">>> [DEBUG] Worker: postprocess mamba: {req_id=}, {src_block_idx=} -> {dest_block_idx=} with bias {accept_token_bias}"
+                    )
+                for mamba_group_id in mamba_group_ids:
+                    self._mamba_copy_block_for_qwen_next(
+                        self.kv_cache_config.kv_cache_groups[mamba_group_id],
+                        src_block_idx,
+                        dest_block_idx,
+                        accept_token_bias,
+                        req_state.block_ids[mamba_group_id],
+                    )
+                if src_block_idx == dest_block_idx:
+                    num_accepted_tokens_cpu[i] = 1
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2716,10 +2902,18 @@ class GPUModelRunner(
                 # TODO(lucas): move cudagraph dispatching here:
                 #   https://github.com/vllm-project/vllm/issues/23789
 
+                if (
+                    envs.VLLM_USE_LIGHTER_MAMBA_CACHE
+                    and self.cache_config.enable_prefix_caching
+                ):
+                    # TODO: add limition: preprocess only have new blocks
+                    self._preprocess_mamba(scheduler_output)
+
                 total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 attn_metadata, spec_decode_common_attn_metadata = (
                     self._build_attention_metadata(
+                        scheduler_output=scheduler_output,
                         total_num_scheduled_tokens=total_num_scheduled_tokens,
                         max_num_scheduled_tokens=max_num_scheduled_tokens,
                         num_reqs=num_reqs,
@@ -2912,9 +3106,17 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+            # if (envs.VLLM_USE_LIGHTER_MAMBA_CACHE
+            #     and self.cache_config.enable_prefix_caching
+            # ):
+            #     self._postprocess_mamba_cache(scheduler_output)
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        self._update_states_after_model_execute(
+            sampler_output.sampled_token_ids, scheduler_output
+        )
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):

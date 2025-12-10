@@ -113,6 +113,19 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+    
+    def pop_row(self, num_blocks: int, row_idx: int):
+        if num_blocks <= 0:
+            return
+        
+        if self.use_hybrid_blocks:
+            num_blocks = num_blocks * self.blocks_per_kv_block
+        
+        end = self.num_blocks_per_row[row_idx]
+        start = end - num_blocks
+        assert start >= 0
+        self.num_blocks_per_row[row_idx] -= num_blocks
+        self.block_table.np[row_idx, start : end] = 0
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -291,6 +304,10 @@ class MultiGroupBlockTable:
             BlockTable(
                 block_size,
                 max_num_reqs,
+                # TODO: when prefix-caching and sps are both enable for 
+                #       mamba hybrid model, it will need 
+                #       `cdiv(max_model_len, block_size * total_cp_world_size) + num_speculative_tokens`
+                #       blocks for mamba groups
                 max(
                     cdiv(max_model_len, block_size * total_cp_world_size),
                     1 + num_speculative_tokens,
@@ -307,6 +324,10 @@ class MultiGroupBlockTable:
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
+
+    def pop_row(self, num_blocks: tuple[int, ...], row_idx: int) -> None:
+        for i, block_table in enumerate(self.block_tables):
+            block_table.pop_row(num_blocks[i], row_idx)
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
