@@ -245,6 +245,7 @@ class Scheduler(SchedulerInterface):
         assert num_external_computed_tokens == 0, (
             "External KV connector is not verified yet"
         )
+        ori_num_new_tokens = num_new_tokens
         # TODO: need check for resume requests
         if request.num_output_tokens == 0:  # prefill
             # To enable block-aligned caching of the Mamba state, `num_new_tokens`
@@ -280,6 +281,7 @@ class Scheduler(SchedulerInterface):
             else:
                 # prefill the last few tokens
                 pass
+            logger.info(f'>>> [DEBUG] mamba align: {request.request_id=}, {request.num_computed_tokens=} | {ori_num_new_tokens=} -> {num_new_tokens=}')
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
@@ -409,9 +411,17 @@ class Scheduler(SchedulerInterface):
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
+                    block_lens = [len(blk) for blk in new_blocks.blocks] if new_blocks is not None else []
+                    if not block_lens:
+                        logger.info(f'>>> [DEBUG] schedule running req {request.request_id=}, {block_lens=}')
+                    elif any(l > 0 for l in block_lens):
+                        logger.info(f'>>> [DEBUG] schedule running req {request.request_id=}, {[len(blk) for blk in new_blocks.blocks]=}')
+
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    logger.info(f'>>> [DEBUG] {request.request_id=} try to preempt')
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -598,6 +608,7 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                # logger.info(f">>> [DEBUG] computed tokens {request.request_id=}, {num_computed_tokens=}")
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -719,6 +730,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    logger.info(f'>>> [DEBUG] Resumed request: {request.request_id=}, {request.num_prompt_tokens=}, {request.num_output_tokens=}, {request.num_computed_tokens=}')
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -870,6 +882,7 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
+        logger.info(f'>>> [DEBUG] preempt request {request.request_id=}, {request.num_prompt_tokens=}, {request.num_output_tokens=} {request.num_computed_tokens=}')
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
