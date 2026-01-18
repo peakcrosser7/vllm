@@ -282,6 +282,8 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
             logger.info(f'>>> [DEBUG] mamba align: {request.request_id=}, {request.num_computed_tokens=} | {ori_num_new_tokens=} -> {num_new_tokens=}')
+        else:
+            logger.info(f'>>> [DEBUG] mamba align: {request.request_id=}, {request.num_computed_tokens=} | {num_new_tokens=}')
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
@@ -412,16 +414,14 @@ class Scheduler(SchedulerInterface):
                     )
 
                     block_lens = [len(blk) for blk in new_blocks.blocks] if new_blocks is not None else []
-                    if not block_lens:
-                        logger.info(f'>>> [DEBUG] schedule running req {request.request_id=}, {block_lens=}')
-                    elif any(l > 0 for l in block_lens):
-                        logger.info(f'>>> [DEBUG] schedule running req {request.request_id=}, {[len(blk) for blk in new_blocks.blocks]=}')
+                    if any(l > 0 for l in block_lens):
+                        logger.info(f'>>> [DEBUG] schedule running req: {request.request_id=}, {block_lens=}, {request.num_computed_tokens=}, {request.num_prompt_tokens=}, {request.num_output_tokens=}')
 
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
 
-                    logger.info(f'>>> [DEBUG] {request.request_id=} try to preempt')
+                    logger.info(f'>>> [DEBUG] {request.request_id=} try to be preempted: {request.num_computed_tokens=}, {request.num_prompt_tokens=}, {request.num_output_tokens=}')
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -608,7 +608,7 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                # logger.info(f">>> [DEBUG] computed tokens {request.request_id=}, {num_computed_tokens=}")
+                logger.info(f">>> [DEBUG] computed tokens for waiting req: {request.request_id=}, {num_computed_tokens=}, {request.num_prompt_tokens=}, {request.num_output_tokens=}")
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -693,6 +693,11 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                 )
+
+
+                block_lens = [len(blk) for blk in new_blocks.blocks] if new_blocks is not None else []
+                if any(l > 0 for l in block_lens):
+                    logger.info(f'>>> [DEBUG] schedule waiting req: {request.request_id=}, {block_lens=}, {request.num_computed_tokens=}, {request.num_prompt_tokens=}, {request.num_output_tokens=}')
 
                 if new_blocks is None:
                     # The request cannot be scheduled.

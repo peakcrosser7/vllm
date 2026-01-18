@@ -616,22 +616,75 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             beta_non_spec = beta
 
         # 2. Recurrent attention
+        def safe_to_cpu(x: torch.Tensor | None):
+            if x is None:
+                return None
+            return x.cpu()
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
-                g=g_spec,
-                beta=beta_spec,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if query_spec.shape[0] == 1 and query_spec.shape[1] > 4:
+                spec_sequence_masks_cpu = spec_sequence_masks.cpu()
+                query_spec_cpu = safe_to_cpu(query_spec)
+                key_spec_cpu = safe_to_cpu(key_spec)
+                value_spec_cpu = safe_to_cpu(value_spec)
+                g_spec_cpu = safe_to_cpu(g_spec)
+                beta_spec_cpu = safe_to_cpu(beta_spec)
+                ssm_state_cpu = safe_to_cpu(ssm_state)
+                spec_query_start_loc_cpu = safe_to_cpu(spec_query_start_loc)
+                self_kv_cache_cpu = [safe_to_cpu(self_kv_cache[0]), safe_to_cpu(self_kv_cache[1])]
+            cu_seqlens_cpu = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1].cpu()
+            ssm_state_indices_cpu = spec_state_indices_tensor.cpu()
+            num_accepted_tokens_cpu = num_accepted_tokens.cpu()
+            try:
+                core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
+                    q=query_spec,
+                    k=key_spec,
+                    v=value_spec,
+                    g=g_spec,
+                    beta=beta_spec,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            except Exception as e:
+                def print_lyt(x: torch.Tensor | None):
+                    if x is None:
+                        return None
+                    return x.shape, x.stride()
+                print(f">>> Error in fused_recurrent_gated_delta_rule:")
+                print(f"query_spec layout: {print_lyt(query_spec)}")
+                print(f"key_spec layout: {print_lyt(key_spec)}")
+                print(f"value_spec layout: {print_lyt(value_spec)}")
+                print(f"g_spec layout: {print_lyt(g_spec)}")
+                print(f"beta_spec layout: {print_lyt(beta_spec)}")
+                print(f"ssm_state layout: {print_lyt(ssm_state)}")
+                print(f"cu_seqlens layout: {print_lyt(spec_query_start_loc[: attn_metadata.num_spec_decodes + 1])}")
+                print(f"ssm_state_indices layout: {print_lyt(spec_state_indices_tensor)}")
+                print(f"num_accepted_tokens layout: {print_lyt(num_accepted_tokens)}")
+                print(f'self_kv_cache layout: {print_lyt(self_kv_cache[0])}, {print_lyt(self_kv_cache[1])}')
+                import time
+                torch.save({
+                    "query_spec": query_spec_cpu,
+                    "key_spec": key_spec_cpu,
+                    "value_spec": value_spec_cpu,
+                    "g_spec": g_spec_cpu,
+                    "beta_spec": beta_spec_cpu,
+                    "ssm_state": ssm_state_cpu,
+                    "spec_query_start_loc": spec_query_start_loc_cpu,
+                    "cu_seqlens": cu_seqlens_cpu,
+                    "ssm_state_indices": ssm_state_indices_cpu,
+                    "num_accepted_tokens": num_accepted_tokens_cpu,
+                    "self_kv_cache": self_kv_cache_cpu,
+                }, f'./gdn_{time.perf_counter_ns()}.pt')
+
+                print(f'spec_sequence_masks: {spec_sequence_masks_cpu}')
+                print(f'cu_seqlens: {cu_seqlens_cpu}')
+                print(f"ssm_state_indices_cpu: {ssm_state_indices_cpu}", flush=True)
+                raise e
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 

@@ -3239,6 +3239,7 @@ class GPUModelRunner(
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
+                dbg_str = f"{self.mamba_state_idx=}"
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
@@ -3302,13 +3303,41 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if is_global_first_rank() and any([v > 4 for v in scheduler_output.num_scheduled_tokens.values()]):
+                print('>>> [DEBUG] GPUModelRunner.execute_model: ', flush=True)
+                print(f'{scheduler_output.num_scheduled_tokens=}', flush=True)
+                print(f'{scheduler_output.scheduled_cached_reqs.num_computed_tokens=}', flush=True)
+                print(f'{scheduler_output.scheduled_cached_reqs.num_output_tokens=}', flush=True)
+                print(f'{scheduler_output.scheduled_cached_reqs.new_block_ids=}', flush=True)
+                print(f'[prev] {dbg_str}', flush=True)
+                print(f'{self.mamba_state_idx=}', flush=True)
+                # print(f'{self.input_batch.num_accepted_tokens_cpu=}', flush=True)
+                for req_id, req_state in self.requests.items():
+                    print(f'self.requests[{req_id=}]: {req_state.num_computed_tokens=}, {req_state.num_prompt_tokens=}, {req_state.num_tokens=}', flush=True)
+                    print(f'self.requests[{req_id=}]: {req_state.block_ids=}', flush=True)   
+
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            except Exception as e:
+                if is_global_first_rank():
+                    print(f">>> Error in self.model_runner.execute_model:")
+                    print(f'{scheduler_output.num_scheduled_tokens=}', flush=True)
+                    print(f'{scheduler_output.scheduled_cached_reqs.num_computed_tokens=}', flush=True)
+                    print(f'{scheduler_output.scheduled_cached_reqs.num_output_tokens=}', flush=True)
+                    print(f'{scheduler_output.scheduled_cached_reqs.new_block_ids=}', flush=True)                    
+                    print(f'[prev] {dbg_str}', flush=True)
+                    print(f'{self.mamba_state_idx=}', flush=True)
+                    print(f'{self.input_batch.num_accepted_tokens_cpu=}', flush=True)
+                    for req_id, req_state in self.requests.items():
+                        print(f'self.requests[{req_id=}]: {req_state.num_computed_tokens=}, {req_state.num_prompt_tokens=}, {req_state.num_tokens=}', flush=True)
+                        print(f'self.requests[{req_id=}]: {req_state.block_ids=}', flush=True)
+                raise e
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
