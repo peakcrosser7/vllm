@@ -340,16 +340,17 @@ class Scheduler(SchedulerInterface):
             num_tokens_to_compute = (
                 request.num_tokens_with_spec + request.num_output_placeholders
             )
+            num_prefill_tokens = max(request.num_prompt_tokens, request.num_preempted_tokens)
             # Ensure new tokens for a request in the prefill phase do not contain
             # draft tokens, especially in the last prefill chunk. For a hybrid-model,
             # extra draft tokens would corrupt the generated Mamba state.
             # TODO: This logic does not yet handle resumed requests.
             if (
                 self.has_mamba_layers
-                and request.num_computed_tokens < request.num_prompt_tokens
+                and request.num_computed_tokens < num_prefill_tokens
             ):
                 num_tokens_to_compute = min(
-                    num_tokens_to_compute, request.num_prompt_tokens
+                    num_tokens_to_compute, num_prefill_tokens
                 )
             num_new_tokens = num_tokens_to_compute - request.num_computed_tokens
 
@@ -884,6 +885,7 @@ class Scheduler(SchedulerInterface):
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         request.num_preemptions += 1
+        request.num_preempted_tokens = request.num_tokens
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 

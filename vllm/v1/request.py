@@ -126,6 +126,9 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # The number of tokens of requests being preempted by the scheduler
+        self.num_preempted_tokens = 0
+
         # The number of tokens that have been computed remotely.
         self.num_external_computed_tokens = 0
 
