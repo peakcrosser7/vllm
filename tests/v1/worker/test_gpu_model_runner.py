@@ -1365,7 +1365,7 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
         block_size=BLOCK_SIZE,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
-        mamba_num_attn_pages=pack_size,
+        attn_pack_size=pack_size,
     )
     parallel_config = ParallelConfig()
     vllm_config = VllmConfig(

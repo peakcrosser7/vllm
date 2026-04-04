@@ -5796,7 +5796,7 @@ class GPUModelRunner(
         )
 
         kv_cache_spec = self.get_kv_cache_spec()
-        attn_pack_size = self.vllm_config.cache_config.mamba_num_attn_pages
+        attn_pack_size = self.vllm_config.cache_config.attn_pack_size
         # When attn_pack_size > 1 (for Mamba models), pack attention layers together
         # to share a KV-block.
         if attn_pack_size > 1:

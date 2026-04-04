@@ -1233,9 +1233,9 @@ class VllmConfig:
             # Default to enable HMA if not explicitly disabled by user or logic above.
             self.scheduler_config.disable_hybrid_kv_cache_manager = False
 
-        if self.cache_config.mamba_num_attn_pages > 1:
+        if self.cache_config.attn_pack_size > 1:
             assert self.model_config.is_hybrid, (
-                "Mapping multiple FullAttention layers to a single page is only "
+                "Packing multiple FullAttention layers to a single page is only "
                 "supported for hybrid models"
             )
 

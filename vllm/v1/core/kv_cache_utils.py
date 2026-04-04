@@ -1513,7 +1513,7 @@ def merge_attn_layers_into_pack(
     """
     Merge attention layers into packs based on attn_pack_size.
 
-    When mamba_num_attn_pages > 1, consecutive attention layers are packed
+    When attn_pack_size > 1, consecutive attention layers are packed
     together to share a KV-block, with the block partitioned across layers.
     This function packs every attn_pack_size consecutive attention layers
     into a group, using "+" as a delimiter to join their layer names into a
@@ -1643,7 +1643,7 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
     """
 
-    attn_pack_size = vllm_config.cache_config.mamba_num_attn_pages
+    attn_pack_size = vllm_config.cache_config.attn_pack_size
     # When attn_pack_size > 1 (for Mamba models), pack attention layers together
     # to share a KV-block.
     if attn_pack_size > 1:

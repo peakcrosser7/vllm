@@ -2264,7 +2264,7 @@ def test_get_kv_cache_configs_with_mamba():
     )
 
     # Test 3: 1 mamba + 2 full attention with group size 2
-    vllm_config.cache_config.mamba_num_attn_pages = 2
+    vllm_config.cache_config.attn_pack_size = 2
     hybrid_kv_cache_specs = {
         "layer_1": new_mamba_spec(),
         "layer_2": new_kv_cache_spec(head_size=32),
@@ -2293,7 +2293,7 @@ def test_get_kv_cache_configs_with_mamba():
     )
 
     # Test 4: 2 mamba + 5 full (with 3 padding full)
-    vllm_config.cache_config.mamba_num_attn_pages = 2
+    vllm_config.cache_config.attn_pack_size = 2
     hybrid_kv_cache_specs = {
         "layer_1": new_mamba_spec(),
         "layer_2": new_mamba_spec(),
