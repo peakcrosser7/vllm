@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
 from math import prod
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1435,7 +1434,8 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
             )
         vllm_ctx = vllm_config.compilation_config.static_forward_context
 
-        runner = GPUModelRunner(vllm_config, DEVICE)
+        runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+        current_platform.update_block_size_for_backend(vllm_config)
         kv_cache_spec = runner.get_kv_cache_spec()
 
         available_memory = 5 * GiB_bytes
@@ -1462,7 +1462,7 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
         f"got {attn_group_spec.pack_size}"
     )
 
-    kv0 = vllm_ctx[attn_layer_names[0]].kv_cache[0]
+    kv0 = vllm_ctx[attn_layer_names[0]].kv_cache
     # FlashInfer logical shape:
     #   (kernel_num_blocks, 2, kernel_block_size, num_kv_heads, head_size)
     expected_attn_shape = tuple(kv0.shape)
@@ -1481,7 +1481,7 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
 
     # --- 1 & 2. Verify shape and dim-0 stride for all Attention layers ---
     for layer_name in attn_layer_names:
-        kv = vllm_ctx[layer_name].kv_cache[0]
+        kv = vllm_ctx[layer_name].kv_cache
         assert tuple(kv.shape) == expected_attn_shape, (
             f"pack_size={pack_size}, {layer_name}: "
             f"expected shape {expected_attn_shape}, got {tuple(kv.shape)}"
@@ -1494,7 +1494,7 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
     # --- 3 & 4. Verify storage sharing, offsets, and write isolation ---
     for pack_start in range(0, len(attn_layer_names), pack_size):
         pack_layers = attn_layer_names[pack_start : pack_start + pack_size]
-        kv_tensors = [vllm_ctx[ln].kv_cache[0] for ln in pack_layers]
+        kv_tensors = [vllm_ctx[ln].kv_cache for ln in pack_layers]
 
         if pack_size > 1:
             # All layers in a pack share the same underlying storage.
@@ -1528,8 +1528,8 @@ def test_hybrid_attention_mamba_kv_cache_pack_size(pack_size: int):
 
     # --- 5. Verify Mamba layer block count is independent of pack_size ---
     for layer_name in mamba_layer_names:
-        conv_state = vllm_ctx[layer_name].kv_cache[0][0]
-        ssm_state = vllm_ctx[layer_name].kv_cache[0][1]
+        conv_state = vllm_ctx[layer_name].kv_cache[0]
+        ssm_state = vllm_ctx[layer_name].kv_cache[1]
         assert conv_state.shape[0] == num_blocks, (
             f"pack_size={pack_size}, {layer_name}: "
             f"conv_state.shape[0] expected {num_blocks}, got {conv_state.shape[0]}"

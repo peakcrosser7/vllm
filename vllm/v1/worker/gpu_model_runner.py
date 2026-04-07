@@ -6674,13 +6674,19 @@ class GPUModelRunner(
                         for i in range(len(kv_cache_stride_order))
                     ]
                     if has_mamba:
+                        block_dim = group.backend.get_kv_cache_block_dim(
+                            kernel_block_sizes[group.kv_cache_group_id],
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            cache_dtype_str=self.cache_config.cache_dtype,
+                        )
                         kv_cache_stride, storage_offset = (
                             mamba_utils.get_hybrid_attention_mamba_layout(
                                 kv_cache_shape=kv_cache_shape,
                                 kv_cache_stride=kv_cache_stride,
                                 kv_cache_spec=kv_cache_spec,
+                                block_dim=block_dim,
                                 layer_idx=layer_idx,
-                                kernel_num_blocks=kernel_num_blocks,
                                 kernel_block_size=kernel_block_size,
                             )
                         )

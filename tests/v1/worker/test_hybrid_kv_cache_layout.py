@@ -88,10 +88,15 @@ def _compute_layout_ref(
     base_stride = list(torch.empty(kv_cache_shape).stride())
 
     storage_offset = 0
+    block_dim = backend.get_kv_cache_block_dim(
+        kernel_block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+        cache_dtype_str="auto",
+    )
     if attn_pack_size > 1:
         # Match the original `_reshape_kv_cache_tensors` logic.
-        kernel_blocks_idx = kv_cache_shape.index(kernel_num_blocks)
-        base_stride[kernel_blocks_idx] *= attn_pack_size
+        base_stride[block_dim] *= attn_pack_size
         dtype_size = get_dtype_size(dtype)
         num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
         num_element_per_attn_pack = (
@@ -113,7 +118,7 @@ def _compute_layout_ref(
     if (
         enable_hybrid_attn_mamba_layout
         and isinstance(kv_cache_spec, AttentionSpec)
-        and kv.shape[0] == 2
+        and block_dim == 1
     ):
         hidden_size = prod(kv.shape[2:])
         attn_pack_size_for_layout = kv_cache_spec.pack_size
@@ -168,12 +173,18 @@ def _compute_layout_new(
     storage_offset = 0
 
     if enable_hybrid_attn_mamba_layout:
+        block_dim = backend.get_kv_cache_block_dim(
+            kernel_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str="auto",
+        )
         kv_cache_stride, storage_offset = mamba_utils.get_hybrid_attention_mamba_layout(
             kv_cache_shape=kv_cache_shape,
             kv_cache_stride=kv_cache_stride,
             kv_cache_spec=kv_cache_spec,
+            block_dim=block_dim,
             layer_idx=layer_idx,
-            kernel_num_blocks=kernel_num_blocks,
             kernel_block_size=kernel_block_size,
         )
 

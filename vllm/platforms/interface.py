@@ -536,6 +536,7 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                pack_size=cache_config.attn_pack_size,
             ).page_size_bytes
         else:
             attn_page_size_1_token = FullAttentionSpec(
@@ -544,6 +545,7 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+                pack_size=cache_config.attn_pack_size,
             ).page_size_bytes
 
         # Compute mamba page size

@@ -279,8 +279,8 @@ def get_hybrid_attention_mamba_layout(
     kv_cache_shape: tuple[int, ...],
     kv_cache_stride: tuple[int, ...],
     kv_cache_spec: AttentionSpec,
+    block_dim: int,
     layer_idx: int,
-    kernel_num_blocks: int,
     kernel_block_size: int,
 ) -> tuple[tuple[int, ...], int]:
     """
@@ -300,21 +300,21 @@ def get_hybrid_attention_mamba_layout(
     storage_offset = 0
 
     attn_pack_size = kv_cache_spec.pack_size
-    kernel_blocks_idx = kv_cache_shape.index(kernel_num_blocks)
-    if kv_cache_shape[0] == 2:
+    # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
+    if block_dim != 0:
         # Hybrid attention+mamba uses (2, num_blocks, ...) logical shape but
         # (num_blocks, 2, ...) physical layout.
-        assert kv_cache_shape[1] != 2, (
+        assert kv_cache_shape[0] == 2, (
             "Fail to determine whether the layout is "
             "(2, num_blocks, ...) or (num_blocks, 2, ...) for "
             f"a tensor of shape {kv_cache_shape}"
         )
-        assert kernel_blocks_idx == 1
+        assert block_dim == 1
         hidden_size = prod(kv_cache_shape[2:])
         target_stride_list[0] = hidden_size
         target_stride_list[1] = 2 * hidden_size
     if attn_pack_size > 1:
-        target_stride_list[kernel_blocks_idx] *= attn_pack_size
+        target_stride_list[block_dim] *= attn_pack_size
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
         num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
         num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
