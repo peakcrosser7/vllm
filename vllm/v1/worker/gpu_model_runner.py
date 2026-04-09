@@ -6724,40 +6724,6 @@ class GPUModelRunner(
 
         return kv_caches
 
-    def _update_hybrid_attention_mamba_layout(
-        self, kv_caches: dict[str, torch.Tensor], kernel_block_sizes: list[int]
-    ) -> None:
-        """
-        Update the layout of attention layers from (2, num_blocks, ...) to
-        (num_blocks, 2, ...).
-
-        Args:
-            kv_caches: The KV cache buffer of each layer.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-        """
-
-        for group in self._kv_cache_spec_attn_group_iterator():
-            kv_cache_spec = group.kv_cache_spec
-            if not isinstance(kv_cache_spec, AttentionSpec):
-                continue
-            block_dim = group.backend.get_kv_cache_block_dim(
-                kernel_block_sizes[group.kv_cache_group_id],
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
-            )
-            # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
-            if block_dim == 0:
-                continue
-            assert block_dim == 1
-            for layer_name in group.layer_names:
-                kv_cache = kv_caches[layer_name]
-                hidden_size = kv_cache.shape[2:].numel()
-                kv_cache.as_strided_(
-                    size=kv_cache.shape,
-                    stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
-                )
-
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
