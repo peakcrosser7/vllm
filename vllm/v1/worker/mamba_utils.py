@@ -313,6 +313,9 @@ def get_hybrid_attention_mamba_layout(
         hidden_size = prod(kv_cache_shape[2:])
         target_stride_list[0] = hidden_size
         target_stride_list[1] = 2 * hidden_size
+    # When multiple attention layers share one physical KV cache block
+    # (attn_pack_size > 1), scale the block-dim stride by attn_pack_size
+    # and compute this layer's element offset within the shared block.
     if attn_pack_size > 1:
         target_stride_list[block_dim] *= attn_pack_size
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
