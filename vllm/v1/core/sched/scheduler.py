@@ -1406,48 +1406,6 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                if not struct_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids
-                ):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
-                        new_token_ids,
-                        req_id,
-                    )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
-
-            routed_experts = None
-            finish_reason = None
-            if stopped:
-                routed_experts = self._get_routed_experts(request)
-
-                # Capture finish_reason BEFORE _handle_stopped_request, which may
-                # reset the status to WAITING for streaming requests that continue.
-                finish_reason = request.get_finished_reason()
-                finished = self._handle_stopped_request(request)
-                if finished:
-                    kv_transfer_params = self._free_request(request)
-
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
-                else:
-                    stopped_preempted_reqs.add(request)
-
-            # Extract sample logprobs if needed.
-            if (
-                request.sampling_params is not None
-                and request.sampling_params.logprobs is not None
-                and logprobs
-            ):
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
-
             if new_token_ids and self.structured_output_manager is not None:
                 # When reasoning ends within this token batch (e.g. during
                 # speculative decoding), only the tokens after the
@@ -1474,6 +1432,31 @@ class Scheduler(SchedulerInterface):
                 self.structured_output_manager.update_reasoning_ended(
                     request, new_token_ids=new_token_ids
                 )
+
+            routed_experts = None
+            finish_reason = None
+            if stopped:
+                routed_experts = self._get_routed_experts(request)
+
+                # Capture finish_reason BEFORE _handle_stopped_request, which may
+                # reset the status to WAITING for streaming requests that continue.
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
+
+            # Extract sample logprobs if needed.
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.logprobs is not None
+                and logprobs
+            ):
+                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
