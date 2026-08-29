@@ -234,6 +234,9 @@ class PleOffloadLayer(nn.Module, ABC):
     def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
         """Initialize metadata needed by dummy offload execution."""
 
+    def validate_offload_metadata(self) -> None:
+        """Validate metadata after all checkpoint weight groups are loaded."""
+
     def setup_cross_process_offload(
         self,
         gpu_output_buffer: torch.Tensor,

@@ -156,6 +156,7 @@ class PleOffloadConnector:
         for layer in layers.values():
             if vllm_config.load_config.load_format == "dummy":
                 layer.initialize_dummy_offload_metadata(self.device)
+            layer.validate_offload_metadata()
             # The CPU worker writes results here through CUDA IPC. The GPU
             # placeholder waits on the paired cross-process semaphore.
             output_buffer = torch.empty(

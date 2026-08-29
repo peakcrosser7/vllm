@@ -42,9 +42,13 @@ class _DummyMetadataPleLayer(_TestPleOffloadLayer):
     def __init__(self) -> None:
         super().__init__()
         self.dummy_metadata_device: torch.device | None = None
+        self.metadata_validated = False
 
     def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
         self.dummy_metadata_device = device
+
+    def validate_offload_metadata(self) -> None:
+        self.metadata_validated = True
 
 
 class _WeightLoadingModel(torch.nn.Module):
@@ -178,6 +182,7 @@ def test_ple_connector_initializes_metadata_only_for_dummy_load(
 
     expected_device = connector.device if load_format == "dummy" else None
     assert model.ple.dummy_metadata_device == expected_device
+    assert model.ple.metadata_validated
     assert list(layers) == ["ple"]
 
 

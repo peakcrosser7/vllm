@@ -224,6 +224,36 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     )
 
 
+def test_ngram_gpu_offload_validates_fp8_scale_after_all_weight_groups(
+    monkeypatch,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod()
+    monkeypatch.setattr(ple_layer_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: torch.device("cpu"),
+    )
+
+    assert not module.load_weights(
+        [("ngram_embedding.shard_0.weight", torch.empty(4, 2))]
+    )
+    module.load_weights([("ngram_embedding.weight_scale", torch.tensor([0.25]))])
+    assert not module.load_weights(
+        [("ngram_embedding.shard_1.weight", torch.empty(4, 2))]
+    )
+    module.validate_offload_metadata()
+
+    missing = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(missing)
+    missing._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod()
+    with pytest.raises(ValueError, match="missing its scale"):
+        missing.validate_offload_metadata()
+
+
 def test_ngram_gpu_offload_accepts_unquantized_embedding(monkeypatch) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
