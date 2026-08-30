@@ -675,6 +675,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 persistent=False,
             )
 
+    def validate_offload_metadata(self) -> None:
+        """Validate quantization metadata after checkpoint loading completes."""
+        quant_method = self._offload_quant_method
+        if isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
+            if not hasattr(self, "_offload_weight_scale"):
+                raise ValueError("FP8 PLE offload checkpoint is missing its scale")
+        elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
+            if not hasattr(self, "_offload_weight_scale_2"):
+                raise ValueError(
+                    "NVFP4 PLE offload checkpoint is missing its global scale"
+                )
+            if not hasattr(self, "_offload_nvfp4_lut"):
+                raise ValueError("NVFP4 PLE offload is missing its dequantization LUT")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
 
@@ -710,23 +724,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     shard_index = int(shard_text)
                     outer_scales[shard_index] = loaded_weight
                     retained.add(name)
-                if not retained:
-                    raise ValueError(
-                        "NVFP4 PLE offload checkpoint is missing its global scale"
+                if outer_scales:
+                    scale_2 = _get_shared_nvfp4_outer_scale(outer_scales).to(
+                        device=torch.accelerator.current_accelerator()
                     )
-                scale_2 = _get_shared_nvfp4_outer_scale(outer_scales).to(
-                    device=torch.accelerator.current_accelerator()
-                )
-                self.register_buffer(
-                    "_offload_weight_scale_2", scale_2, persistent=False
-                )
-                self.register_buffer(
-                    "_offload_nvfp4_lut",
-                    torch.tensor(
-                        _FP4_VALUES, dtype=torch.float32, device=scale_2.device
-                    ),
-                    persistent=False,
-                )
+                    self.register_buffer(
+                        "_offload_weight_scale_2", scale_2, persistent=False
+                    )
+                    self.register_buffer(
+                        "_offload_nvfp4_lut",
+                        torch.tensor(
+                            _FP4_VALUES, dtype=torch.float32, device=scale_2.device
+                        ),
+                        persistent=False,
+                    )
             else:
                 for _ in weights:
                     pass
