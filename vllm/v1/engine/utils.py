@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -64,6 +65,17 @@ def get_engine_process_shutdown_timeout(
     if request_timeout == 0 and process_timeout == 0 and current_platform.is_rocm():
         return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
     return process_timeout
+
+# Wall-clock backstop for a LIVE-but-hung EngineCore. wait_for_engine_startup()
+# below only raises when a core proc EXITS (a sentinel fires); a proc that is
+# alive but never sends its ready message -- e.g. the TP=1 PLE CPU/disk-offload
+# warmup rendezvous deadlock (vllm-project/vllm#53960) -- would otherwise loop
+# here forever. This bound sits WELL ABOVE a full cold boot (~13-14 min here) so
+# it never pre-empts a slow-but-healthy start; it converts an infinite wait into
+# a NAMED TimeoutError. Override with VLLM_ENGINE_CORE_STARTUP_TIMEOUT (seconds).
+ENGINE_CORE_STARTUP_TIMEOUT_S = float(
+    os.getenv("VLLM_ENGINE_CORE_STARTUP_TIMEOUT", "1800")
+)
 
 
 class CoreEngineState(Enum):
@@ -1283,6 +1295,7 @@ def wait_for_engine_startup(
         frontend_process_by_fd[fd] = proc
         poller.register(fd, zmq.POLLIN)
 
+    startup_deadline = time.monotonic() + ENGINE_CORE_STARTUP_TIMEOUT_S
     while any(conn_pending) or any(start_pending):
         events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
@@ -1295,6 +1308,24 @@ def wait_for_engine_startup(
                 logger.debug(
                     "Waiting for %d local, %d remote core engine proc(s) to start.",
                     *start_pending,
+                )
+            # A proc EXIT is handled below (a sentinel fires and produces an
+            # event). Reaching the deadline with no event means the proc(s) are
+            # ALIVE but not ready -- a live hang, not an exit -- so name it
+            # rather than loop forever (vllm-project/vllm#53960).
+            if time.monotonic() >= startup_deadline:
+                raise TimeoutError(
+                    "EngineCore startup exceeded "
+                    f"{ENGINE_CORE_STARTUP_TIMEOUT_S:.0f}s with "
+                    f"{conn_pending[0]} local + {conn_pending[1]} remote proc(s) "
+                    f"still to connect and {start_pending[0]} local + "
+                    f"{start_pending[1]} remote proc(s) still to start. The core "
+                    "engine process(es) are ALIVE but have not sent a ready "
+                    "message -- this is a live hang, distinct from a process "
+                    "exit (reported separately with the exit code). A PLE "
+                    "CPU/disk-offload warmup rendezvous deadlock on TP=1 "
+                    "(vllm-project/vllm#53960) is one known cause. Adjust with "
+                    "VLLM_ENGINE_CORE_STARTUP_TIMEOUT."
                 )
             continue
         if len(events) > 1 or events[0][0] != handshake_socket:
