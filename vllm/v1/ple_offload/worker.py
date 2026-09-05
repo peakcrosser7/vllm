@@ -25,6 +25,7 @@ import pickle
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -60,11 +61,21 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
+    PleOffloadRegistrationAck,
     PleOffloadRequest,
+    barrier_timeout_s,
 )
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Recheck the startup deadline this often while waiting for registrations. Only
+# the poll granularity -- the wait itself is bounded by barrier_timeout_s().
+_REGISTRATION_RECV_SLICE_MS = 1000
+# Bounded flush window for each ACK PUSH. The peer (connector) is already bound
+# and polling when the ACK is sent, so delivery is immediate; this only caps how
+# long close() may linger if a GPU worker died after registering.
+_ACK_SEND_LINGER_MS = 30000
 
 
 @dataclass
@@ -479,21 +490,59 @@ class PleOffloadRunner:
         """Receive every local DP/TP worker's IPC and shared-memory buffers."""
         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
         registrations: list[PleOffloadRegistration] = []
-        for index in range(num_workers):
-            item = pickle.loads(pull_socket.recv())
-            if not isinstance(item, PleOffloadRegistration):
-                raise RuntimeError(
-                    "Expected PleOffloadRegistration during setup, got "
-                    f"{type(item).__name__} ({index + 1}/{num_workers})"
+        # STARTUP-PHASE-ONLY bound (vllm-project/vllm#53960). This recv runs
+        # exactly once at boot; the steady-state decode path is busy_loop, which
+        # is left fully blocking (see below). A lost or never-sent registration
+        # would otherwise block here forever; bound it WELL ABOVE a legitimate
+        # cold boot and name the failure with both process states. RCVTIMEO is
+        # restored to blocking before busy_loop so decode is byte-for-byte
+        # identical to upstream.
+        timeout_s = barrier_timeout_s()
+        deadline = time.monotonic() + timeout_s
+        supports_timeout = hasattr(pull_socket, "setsockopt")
+        if supports_timeout:
+            pull_socket.setsockopt(zmq.RCVTIMEO, _REGISTRATION_RECV_SLICE_MS)
+        try:
+            for index in range(num_workers):
+                raw = None
+                while raw is None:
+                    try:
+                        raw = pull_socket.recv()
+                    except zmq.Again:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "PLE offload worker received "
+                                f"{index}/{num_workers} GPU worker "
+                                f"registration(s) within {timeout_s:.0f}s and is "
+                                "still waiting for the rest. Offload-worker "
+                                "state: alive, blocked on the registration PULL "
+                                "socket. GPU-worker state: at least one worker "
+                                "has not sent its registration -- it is hung in "
+                                "load_model, has died during startup, or its "
+                                "registration was lost in transit. This is the "
+                                "TP=1 PLE-offload warmup rendezvous deadlock "
+                                "(vllm-project/vllm#53960): a boot that reaches "
+                                "this bound is hung, not merely slow."
+                            )
+                item = pickle.loads(raw)
+                if not isinstance(item, PleOffloadRegistration):
+                    raise RuntimeError(
+                        "Expected PleOffloadRegistration during setup, got "
+                        f"{type(item).__name__} ({index + 1}/{num_workers})"
+                    )
+                registrations.append(item)
+                logger.info(
+                    "GPU worker %d registered (dp_rank=%d, tp_rank=%d, layers=%s).",
+                    item.worker_id,
+                    item.dp_rank,
+                    item.tp_rank,
+                    sorted(item.gpu_output_buffers),
                 )
-            registrations.append(item)
-            logger.info(
-                "GPU worker %d registered (dp_rank=%d, tp_rank=%d, layers=%s).",
-                item.worker_id,
-                item.dp_rank,
-                item.tp_rank,
-                sorted(item.gpu_output_buffers),
-            )
+        finally:
+            if supports_timeout:
+                # Restore blocking recv: the steady-state busy_loop below stays
+                # UNBOUNDED and measurement-neutral for the decode path.
+                pull_socket.setsockopt(zmq.RCVTIMEO, -1)
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
@@ -581,6 +630,44 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+        # Release each GPU worker's startup rendezvous barrier only now that its
+        # output targets exist, so the ACK truly means "you are being served"
+        # (vllm-project/vllm#53960).
+        self._send_registration_acks(pull_socket, registrations)
+
+    def _send_registration_acks(
+        self,
+        pull_socket: zmq.Socket,
+        registrations: list[PleOffloadRegistration],
+    ) -> None:
+        """PUSH one ACK to every GPU worker that supplied an ``ack_addr``.
+
+        The ACK is the reply half of the startup rendezvous barrier
+        (connector._await_registration_ack). Workers that supply no ack_addr
+        (legacy path, unit tests) are skipped.
+        """
+        ack_targets = [r for r in registrations if getattr(r, "ack_addr", "")]
+        if not ack_targets:
+            return
+        context = pull_socket.context
+        num_layers = len(self.layer_names)
+        for registration in ack_targets:
+            socket = context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.LINGER, _ACK_SEND_LINGER_MS)
+            try:
+                socket.connect(registration.ack_addr)
+                socket.send(
+                    msgspec.msgpack.encode(
+                        PleOffloadRegistrationAck(
+                            worker_id=registration.worker_id,
+                            num_layers=num_layers,
+                        )
+                    )
+                )
+            finally:
+                socket.close()
+        logger.info("PleOffload: sent %d registration ACK(s).", len(ack_targets))
 
     @torch.inference_mode()
     def busy_loop(
