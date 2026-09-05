@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import ctypes
 import gc
 import os
+import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -175,6 +177,26 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _allow_ptrace_from_offload_worker() -> None:
+    """Let the PLE offload process rebuild this worker's CUDA IPC tensors.
+
+    Rebuilding a shared CUDA tensor calls pidfd_getfd on the exporting process,
+    which Yama ptrace_scope=1 permits only from descendants; the offload worker
+    is a sibling process, so the exporting worker opts in explicitly. The call
+    is a no-op where prctl or Yama are unavailable.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    pr_set_ptracer = 0x59616D61
+    pr_set_ptracer_any = ctypes.c_ulong(-1)
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(pr_set_ptracer, pr_set_ptracer_any, 0, 0, 0)
+    except (OSError, AttributeError):
+        logger.debug("prctl(PR_SET_PTRACER) unavailable; PLE offload may need "
+                     "kernel.yama.ptrace_scope=0")
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -224,6 +246,7 @@ class Worker(WorkerBase):
         if envs.VLLM_PLE_CPU_OFFLOAD:
             if self._ple_offload_enabled:
                 self._validate_ple_offload_config()
+                _allow_ptrace_from_offload_worker()
             elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
                 text_config = self.model_config.hf_text_config
                 logger.warning(
