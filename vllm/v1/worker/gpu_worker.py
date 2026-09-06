@@ -193,8 +193,10 @@ def _allow_ptrace_from_offload_worker() -> None:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         libc.prctl(pr_set_ptracer, pr_set_ptracer_any, 0, 0, 0)
     except (OSError, AttributeError):
-        logger.debug("prctl(PR_SET_PTRACER) unavailable; PLE offload may need "
-                     "kernel.yama.ptrace_scope=0")
+        logger.debug(
+            "prctl(PR_SET_PTRACER) unavailable; PLE offload may need "
+            "kernel.yama.ptrace_scope=0"
+        )
 
 
 class Worker(WorkerBase):

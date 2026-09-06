@@ -66,6 +66,7 @@ def get_engine_process_shutdown_timeout(
         return ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S
     return process_timeout
 
+
 # Wall-clock backstop for a LIVE-but-hung EngineCore. wait_for_engine_startup()
 # below only raises when a core proc EXITS (a sentinel fires); a proc that is
 # alive but never sends its ready message -- e.g. the TP=1 PLE CPU/disk-offload

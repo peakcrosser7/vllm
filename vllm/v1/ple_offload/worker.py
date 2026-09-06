@@ -523,7 +523,7 @@ class PleOffloadRunner:
                                 "TP=1 PLE-offload warmup rendezvous deadlock "
                                 "(vllm-project/vllm#53960): a boot that reaches "
                                 "this bound is hung, not merely slow."
-                            )
+                            ) from None
                 item = pickle.loads(raw)
                 if not isinstance(item, PleOffloadRegistration):
                     raise RuntimeError(
