@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
@@ -23,10 +24,16 @@ from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
 )
 from vllm.v1.ple_offload.protocol import (
+    _PLE_OFFLOAD_ACK_DECODER,
     PleOffloadRegistration,
     PleOffloadRequest,
+    barrier_timeout_s,
 )
 from vllm.v1.utils import record_function_or_nullcontext
+
+# Poll granularity for the startup ACK wait. The wait itself is bounded by
+# barrier_timeout_s(); this only controls how often the deadline is rechecked.
+_ACK_POLL_MS = 1000
 
 logger = init_logger(__name__)
 
@@ -64,6 +71,13 @@ class PleOffloadConnector:
         self.device = device
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
+        # Stable per-worker id, matching the offload worker's expectation, plus
+        # the private endpoint the offload worker returns this worker's ACK on.
+        self._worker_id = (
+            self.dp_rank * vllm_config.parallel_config.world_size
+            + vllm_config.parallel_config.rank
+        )
+        self._ack_addr = f"{ipc_addr}.ack.{self._worker_id}"
         self._layers = self._setup_layers(vllm_config, model)
 
         # TP0 registers shared buffers with CUDA for asynchronous D2H copies.
@@ -104,13 +118,26 @@ class PleOffloadConnector:
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
+        self._ack_socket: zmq.Socket | None = None
         self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
 
         try:
             self._zmq_ctx = zmq.Context()
+            # Bind the ACK endpoint BEFORE registering so the offload worker's
+            # later PUSH always has a bound peer to reach.
+            self._ack_socket = self._zmq_ctx.socket(zmq.PULL)
+            self._ack_socket.bind(self._ack_addr)
             self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
             self._registration_socket.connect(ipc_addr)
             self._register_with_offload_worker(vllm_config, ipc_addr)
+
+            # STARTUP RENDEZVOUS BARRIER (vllm-project/vllm#53960): block here
+            # until the offload worker acknowledges this registration. This
+            # orders offload-ready BEFORE the first warmup forward (which runs
+            # only after this constructor returns) and turns a lost registration
+            # into a NAMED failure instead of an infinite GPU-stream wait. It is
+            # a one-time STARTUP wait; the steady-state decode path is untouched.
+            self._await_registration_ack(ipc_addr)
 
             if self.tp_rank == 0:
                 # ForkingPickler may replace CPU storage while converting its
@@ -203,10 +230,7 @@ class PleOffloadConnector:
         # Each GPU worker owns distinct output buffers, while TP0's shared
         # inputs become the request source for its DP rank.
         registration = PleOffloadRegistration(
-            worker_id=(
-                self.dp_rank * vllm_config.parallel_config.world_size
-                + vllm_config.parallel_config.rank
-            ),
+            worker_id=self._worker_id,
             tp_rank=self.tp_rank,
             dp_rank=self.dp_rank,
             gpu_output_buffers={
@@ -218,6 +242,7 @@ class PleOffloadConnector:
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
+            ack_addr=self._ack_addr,
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
@@ -241,6 +266,49 @@ class PleOffloadConnector:
             ipc_addr,
             sorted(self._layers),
         )
+
+    def _await_registration_ack(self, ipc_addr: str) -> None:
+        """Block until the offload worker acknowledges this registration.
+
+        This is the STARTUP rendezvous barrier. It is bounded WELL ABOVE a
+        legitimate cold boot: a healthy offload worker only sends the ACK once
+        it has received every GPU worker's registration and built their output
+        targets, so a slow sibling can legitimately delay it, but an infinite
+        wait means a registration was lost, the offload worker died, or it is
+        itself hung -- all of which are named here rather than left to surface
+        as an untimed ``cuStreamWaitValue32`` hang in the first warmup forward
+        (vllm-project/vllm#53960).
+        """
+        assert self._ack_socket is not None
+        timeout_s = barrier_timeout_s()
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._ack_socket.poll(timeout=_ACK_POLL_MS):
+                ack = _PLE_OFFLOAD_ACK_DECODER.decode(self._ack_socket.recv())
+                logger.info(
+                    "PleOffload: registration ACK received "
+                    "(worker_id=%d, dp_rank=%d, tp_rank=%d, layers=%d).",
+                    ack.worker_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    ack.num_layers,
+                )
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "PLE offload registration was not acknowledged within "
+                    f"{timeout_s:.0f}s. "
+                    "GPU-worker state: registration sent to the offload PULL "
+                    f"socket at {ipc_addr}, then blocked awaiting the ACK on "
+                    f"{self._ack_addr} (dp_rank={self.dp_rank}, "
+                    f"tp_rank={self.tp_rank}, worker_id={self._worker_id}). "
+                    "Offload-worker state: has NOT sent this ACK -- it is still "
+                    "collecting the expected registrations, has died during "
+                    "startup, or this registration message was lost in transit. "
+                    "This is the TP=1 PLE-offload warmup rendezvous deadlock "
+                    "(vllm-project/vllm#53960): a boot that reaches this bound "
+                    "is hung, not merely slow."
+                )
 
     def _start_request_thread(self, ipc_addr: str) -> None:
         """Start the thread that publishes batches after inputs are ready."""
@@ -428,6 +496,9 @@ class PleOffloadConnector:
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)
             self._registration_socket = None
+        if self._ack_socket is not None:
+            self._ack_socket.close(linger=0)
+            self._ack_socket = None
         if self._zmq_ctx is not None:
             self._zmq_ctx.term()
             self._zmq_ctx = None
